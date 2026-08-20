@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Canonical key representation.
+#
+# This is the ONLY place key strings are normalized. Three input formats must
+# collapse to one string, or conflict detection compares unequal things and
+# silently misses real conflicts.
+#
+# Canonical form: modifiers in fixed order SUPER CTRL ALT SHIFT, joined to the
+# key with " + ", key part UPPERCASED.  e.g.  SUPER + SHIFT + W
+#
+# Two forms exist on purpose, because one cannot do both jobs:
+#
+#   canonical  - for COMPARISON. Uppercase everything so the inconsistency in
+#                real config collapses. `hyprctl binds` echoes source spelling
+#                verbatim, and Omarchy's own defaults contain both "Delete" and
+#                "DELETE"; compared literally those are two different keys.
+#   spelling   - for WRITING into bindings.lua. Some keysyms only match in
+#                xkbcommon's lowercase spelling; Omarchy's source says so of
+#                comma directly: the upper-case "COMMA" does not match.
+set -uo pipefail
+
+# Keys that must be written lowercase to match, and mouse/code forms that must
+# never be uppercased at all.
+LOWER_SPELLING=" comma period slash semicolon apostrophe grave minus equal \
+backslash bracketleft bracketright "
+
+canon_key() {
+  local k="$1"
+  # Mouse and raw scancode forms have no case at all - pass them through.
+  case "${k,,}" in
+    mouse:*|mouse_*|code:*) printf '%s' "${k,,}"; return ;;
+  esac
+  printf '%s' "${k^^}"
+}
+
+# emit <super> <ctrl> <alt> <shift> <key>  -- flags are 1/0
+emit() {
+  local out=""
+  [[ $1 == 1 ]] && out+="SUPER + "
+  [[ $2 == 1 ]] && out+="CTRL + "
+  [[ $3 == 1 ]] && out+="ALT + "
+  [[ $4 == 1 ]] && out+="SHIFT + "
+  printf '%s%s\n' "$out" "$(canon_key "$5")"
+}
+
+case "${1:-}" in
+  hypr)
+    # Hyprland modmask bits: SHIFT=1 CTRL=4 ALT=8 SUPER=64
+    m="${2:?modmask}"; key="${3:?keysym}"
+    emit $(( (m & 64) != 0 )) $(( (m & 4) != 0 )) \
+         $(( (m & 8) != 0 )) $(( (m & 1) != 0 )) "$key"
+    ;;
+  qt)
+    # Qt::Key decimal + Qt::KeyboardModifiers mask
+    # Shift=0x02000000 Ctrl=0x04000000 Alt=0x08000000 Meta=0x10000000
+    k="${2:?qt key}"; m="${3:?qt modifiers}"
+    case "$k" in
+      32)       key=space ;;
+      44)       key=comma ;;
+      46)       key=period ;;
+      47)       key=slash ;;
+      45)       key=minus ;;
+      61)       key=equal ;;
+      59)       key=semicolon ;;
+      96)       key=grave ;;
+      16777216) key=escape ;;
+      16777220) key=return ;;
+      16777217) key=tab ;;
+      16777219) key=backspace ;;
+      16777223) key=delete ;;
+      16777232) key=home ;;
+      16777233) key=end ;;
+      16777234) key=left ;;
+      16777235) key=up ;;
+      16777236) key=right ;;
+      16777237) key=down ;;
+      *)
+        if (( k >= 33 && k <= 126 )); then
+          # Printable ASCII: Qt::Key_A is 0x41, matching the character code.
+          key=$(printf "\\$(printf '%03o' "$k")")
+        elif (( k >= 16777264 && k <= 16777275 )); then
+          key="F$(( k - 16777263 ))"
+        else
+          exit 1
+        fi
+        ;;
+    esac
+    emit $(( (m & 268435456) != 0 )) $(( (m & 67108864) != 0 )) \
+         $(( (m & 134217728) != 0 )) $(( (m & 33554432) != 0 )) "$key"
+    ;;
+  lua)
+    # Free text as written in bindings.lua: "SUPER + SHIFT + W" or "super+shift+w"
+    src="${2:?source text}"
+    s=0 c=0 a=0 sh=0 key=""
+    IFS='+' read -ra parts <<<"${src// /}"
+    for p in "${parts[@]}"; do
+      [[ -z $p ]] && continue
+      case "${p^^}" in
+        SUPER|MOD|WIN|META) s=1 ;;
+        CTRL|CONTROL)       c=1 ;;
+        ALT)                a=1 ;;
+        SHIFT)              sh=1 ;;
+        *)                  key="$p" ;;
+      esac
+    done
+    [[ -z $key ]] && exit 1
+    emit $s $c $a $sh "$key"
+    ;;
+  spell)
+    # Canonical -> the spelling that is safe to write into bindings.lua.
+    # Modifiers are already canonical; only the key part may need lowering.
+    src="${2:?canonical}"
+    mods="${src% + *}"; key="${src##* + }"
+    [[ $src != *" + "* ]] && { mods=""; key="$src"; }
+    lk="${key,,}"
+    if [[ $LOWER_SPELLING == *" $lk "* ]] || [[ $lk == mouse:* || $lk == mouse_* || $lk == code:* ]]; then
+      key="$lk"
+    fi
+    [[ -n $mods ]] && printf '%s + %s\n' "$mods" "$key" || printf '%s\n' "$key"
+    ;;
+  *)
+    echo "usage: keysmith-keys hypr <modmask> <keysym>" >&2
+    echo "       keysmith-keys qt <qtkey> <qtmods>" >&2
+    echo "       keysmith-keys lua \"<source text>\"" >&2
+    echo "       keysmith-keys spell \"<canonical>\"" >&2
+    exit 1
+    ;;
+esac

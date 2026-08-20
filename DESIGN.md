@@ -117,10 +117,21 @@ Omarchy's `"SUPER + SHIFT + W"` source text, and captured `Qt::Key` plus
 modifier mask. Canonical form fixes modifier order (SUPER, CTRL, ALT, SHIFT),
 casing, and keysym spelling.
 
-Spelling matters and is not cosmetic: the packaged Lua carries the comment
-*"xkbcommon names the comma keysym `comma`; the upper-case `COMMA` does not
-match."* A conflict that exists but compares unequal is the one bug that would
-discredit the whole tool.
+**Two forms are required, not one.** Measured against the live system,
+`hyprctl binds` echoes each bind's *source* spelling rather than a normalized
+keysym — and Omarchy's own defaults are internally inconsistent, containing
+both `Delete` and `DELETE`. Compared literally those are different keys.
+
+- **canonical** — for comparison. Uppercase everything, so spelling variance
+  collapses. `mouse:272`, `mouse_down` and `code:201` pass through untouched,
+  having no case.
+- **spelling** — for writing. Some keysyms only match in xkbcommon's lowercase
+  form; the packaged Lua says so of comma directly: *"xkbcommon names the comma
+  keysym `comma`; the upper-case `COMMA` does not match."*
+
+A single form cannot do both jobs: uppercase-only breaks writing, lowercase-only
+fails to collapse `Delete`/`DELETE`. A conflict that exists but compares unequal
+is the one bug that would discredit the whole tool.
 
 ### App identity
 

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -uo pipefail
+K="$(cd "$(dirname "$0")/.." && pwd)/keysmith-keys"
+fail=0
+check() {
+  local want="$1"; shift
+  local got; got="$("$K" "$@" 2>/dev/null)"
+  if [[ $got == "$want" ]]; then echo "ok   $* -> $got"
+  else echo "FAIL $* -> '$got' (want '$want')"; fail=1; fi
+}
+
+# Qt: Meta=0x10000000 Shift=0x02000000 Ctrl=0x04000000 Alt=0x08000000
+check "SUPER + SHIFT + W"  qt 87 301989888
+check "SUPER + SPACE"      qt 32 268435456
+# hypr modmask: SHIFT=1 CTRL=4 ALT=8 SUPER=64
+check "SUPER + SHIFT + W"  hypr 65 w
+check "SUPER + SPACE"      hypr 64 space
+# lua source text
+check "SUPER + SHIFT + W"  lua "SUPER + SHIFT + W"
+check "SUPER + SHIFT + W"  lua "super+shift+w"
+# Canonical is uppercase in every format, so real-world spelling variance
+# collapses. Omarchy's own defaults contain BOTH "Delete" and "DELETE".
+check "SUPER + COMMA"      hypr 64 comma
+check "SUPER + COMMA"      lua "SUPER + comma"
+check "SUPER + COMMA"      qt 44 268435456
+check "SUPER + DELETE"     hypr 64 Delete
+check "SUPER + DELETE"     hypr 64 DELETE
+check "SUPER + DELETE"     lua "SUPER + Delete"
+# mouse and scancode forms have no case and must pass through untouched
+check "SUPER + mouse:272"  hypr 64 "mouse:272"
+
+# spell: canonical -> what is safe to WRITE into bindings.lua
+check "SUPER + comma"          spell "SUPER + COMMA"
+check "SUPER + SHIFT + W"      spell "SUPER + SHIFT + W"
+check "SUPER + SPACE"          spell "SUPER + SPACE"
+check "SUPER + mouse:272"      spell "SUPER + mouse:272"
+check "W"                      spell "W"
+# modifier ordering is canonical regardless of input order
+check "SUPER + CTRL + ALT + SHIFT + K" lua "shift+alt+ctrl+super+k"
+
+[[ $fail == 0 ]] && echo "PASS" || echo "FAILED"
+exit $fail
