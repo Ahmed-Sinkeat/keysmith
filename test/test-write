@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# The two assertions that matter most here are "pre-existing error does not
+# roll back" and "second reload issued after restore". Everything else is
+# scaffolding around proving those.
+set -uo pipefail
+W="$(cd "$(dirname "$0")/.." && pwd)/keysmith-write"
+fail=0
+say() { if [[ $1 == 0 ]]; then echo "ok   $2"; else echo "FAIL $2"; fail=1; fi }
+
+tmp=$(mktemp -d)
+export KEYSMITH_BINDINGS="$tmp/bindings.lua"
+export KEYSMITH_RELOAD_LOG="$tmp/reloads"
+export KEYSMITH_DRYRUN=1
+printf -- '-- user bindings\n' > "$KEYSMITH_BINDINGS"
+
+# --- 1. free key: o.bind only, wrapped in owned markers -------------------
+KEYSMITH_TAKEN="" "$W" "SUPER + SHIFT + V" "Code" '{ launch = "code" }' >/dev/null 2>&1
+say $? "free key writes successfully"
+grep -q 'keysmith:begin' "$KEYSMITH_BINDINGS"; say $? "block markers written"
+grep -q 'keysmith:end' "$KEYSMITH_BINDINGS"; say $? "closing marker written"
+grep -qF 'o.bind("SUPER + SHIFT + V", "Code", { launch = "code" })' "$KEYSMITH_BINDINGS"
+say $? "o.bind emitted verbatim"
+! grep -q 'hl.unbind' "$KEYSMITH_BINDINGS"; say $? "no unbind for a free key"
+
+# --- 2. taken key without --replace refuses, exit 2, file untouched -------
+before=$(cat "$KEYSMITH_BINDINGS")
+KEYSMITH_TAKEN="SUPER + SHIFT + W" "$W" "SUPER + SHIFT + W" "Typora" '"typora"' >/dev/null 2>&1
+[[ $? -eq 2 ]]; say $? "refuses taken key with exit 2"
+[[ "$(cat "$KEYSMITH_BINDINGS")" == "$before" ]]; say $? "file untouched on refusal"
+
+# --- 3. taken key with --replace emits unbind immediately before bind -----
+KEYSMITH_TAKEN="SUPER + SHIFT + W" "$W" "SUPER + SHIFT + W" "Typora" '"typora"' --replace >/dev/null 2>&1
+say $? "replace succeeds"
+grep -A1 'hl.unbind("SUPER + SHIFT + W")' "$KEYSMITH_BINDINGS" | grep -qF 'o.bind("SUPER + SHIFT + W"'
+say $? "unbind emitted immediately before bind"
+
+# --- 4. the key is written in SAFE spelling, not canonical ---------------
+KEYSMITH_TAKEN="" "$W" "SUPER + COMMA" "Notes" '"notes"' >/dev/null 2>&1
+grep -qF 'o.bind("SUPER + comma"' "$KEYSMITH_BINDINGS"
+say $? "canonical COMMA written back as lowercase comma"
+
+# --- 5. a PRE-EXISTING config error must NOT trigger rollback ------------
+unset KEYSMITH_DRYRUN
+export KEYSMITH_FAKE_BASELINE="pre-existing error"
+export KEYSMITH_FAKE_AFTER="pre-existing error"
+KEYSMITH_TAKEN="" "$W" "SUPER + ALT + J" "Thing" '"thing"' >/dev/null 2>&1
+[[ $? -eq 0 ]]; say $? "pre-existing error does not roll back"
+grep -q 'SUPER + ALT + J' "$KEYSMITH_BINDINGS"; say $? "write survived pre-existing error"
+
+# --- 6. a NEW error rolls back AND reloads a second time -----------------
+export KEYSMITH_FAKE_BASELINE=""
+export KEYSMITH_FAKE_AFTER="new error"
+: > "$KEYSMITH_RELOAD_LOG"
+before=$(cat "$KEYSMITH_BINDINGS")
+KEYSMITH_TAKEN="" "$W" "SUPER + ALT + K" "Bad" '"bad"' >/dev/null 2>&1
+[[ $? -eq 3 ]]; say $? "new error exits 3"
+[[ "$(cat "$KEYSMITH_BINDINGS")" == "$before" ]]; say $? "bytes restored exactly"
+[[ $(wc -l < "$KEYSMITH_RELOAD_LOG") -ge 2 ]]
+say $? "second reload issued after restore (runtime state undone, not just disk)"
+
+# --- 7. rollback that fails to restore baseline reports exit 4 -----------
+export KEYSMITH_FAKE_BASELINE=""
+export KEYSMITH_FAKE_AFTER="new error"
+export KEYSMITH_FAKE_RESTORED="still broken"
+KEYSMITH_TAKEN="" "$W" "SUPER + ALT + L" "Worse" '"worse"' >/dev/null 2>&1
+[[ $? -eq 4 ]]; say $? "incomplete rollback exits 4 instead of claiming success"
+
+rm -rf "$tmp"
+[[ $fail == 0 ]] && echo "PASS" || echo "FAILED"
+exit $fail

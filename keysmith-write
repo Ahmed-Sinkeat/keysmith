@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Apply one binding to the user's bindings.lua.
+#
+# Usage: keysmith-write <canonicalKey> <label> <actionText> [--replace]
+#
+# Exit codes:
+#   0  written and verified
+#   2  combo is taken and --replace was not given (nothing written)
+#   3  new config error, change rolled back and runtime restored
+#   4  rollback did not restore the baseline - needs a human
+#
+# Two rules drive the shape of this file:
+#
+#   A non-empty `hyprctl configerrors` does not mean WE broke something. The
+#   file may have been broken before Keysmith touched it, and rolling back a
+#   correct change because of someone else's error is its own bug. So compare
+#   against a baseline taken before writing, never against "is it empty".
+#
+#   Restoring bytes on disk does not undo what Hyprland already loaded. A
+#   failed write must reload a SECOND time, or the file ends up correct while
+#   the live session stays wrong - which looks like success and is not.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+KEYS="$HERE/keysmith-keys"
+BINDINGS="${KEYSMITH_BINDINGS:-$HOME/.config/hypr/bindings.lua}"
+
+key="${1:?canonical key}"
+label="${2:?label}"
+action="${3:?action text}"
+replace=0
+[[ "${4:-}" == "--replace" ]] && replace=1
+
+phase=baseline
+
+# Test seams. They exist so the rollback paths can be exercised without
+# breaking a real config; in normal use none of these are set.
+configerrors() {
+  case "$phase" in
+    baseline)  [[ -n ${KEYSMITH_FAKE_BASELINE+x} ]] && { printf '%s' "$KEYSMITH_FAKE_BASELINE"; return; } ;;
+    after)     [[ -n ${KEYSMITH_FAKE_AFTER+x}    ]] && { printf '%s' "$KEYSMITH_FAKE_AFTER"; return; } ;;
+    restored)  [[ -n ${KEYSMITH_FAKE_RESTORED+x} ]] && { printf '%s' "$KEYSMITH_FAKE_RESTORED"; return; }
+               [[ -n ${KEYSMITH_FAKE_BASELINE+x} ]] && { printf '%s' "$KEYSMITH_FAKE_BASELINE"; return; } ;;
+  esac
+  hyprctl configerrors 2>/dev/null | grep -v '^[[:space:]]*$'
+}
+
+reload() {
+  [[ -n ${KEYSMITH_RELOAD_LOG:-} ]] && echo reload >>"$KEYSMITH_RELOAD_LOG"
+  [[ ${KEYSMITH_DRYRUN:-0} == 1 ]] && return 0
+  hyprctl reload >/dev/null 2>&1
+}
+
+is_taken() {
+  if [[ -n ${KEYSMITH_TAKEN+x} ]]; then
+    [[ -n $KEYSMITH_TAKEN && $KEYSMITH_TAKEN == "$key" ]]
+    return
+  fi
+  "$HERE/keysmith-read" 2>/dev/null |
+    jq -e --arg k "$key" 'any(.[]; .key == $k)' >/dev/null 2>&1
+}
+
+if is_taken && (( ! replace )); then
+  echo "taken: $key" >&2
+  exit 2
+fi
+
+mkdir -p "$(dirname "$BINDINGS")"
+touch "$BINDINGS"
+
+baseline="$(configerrors)"
+saved="$(cat "$BINDINGS")"
+id=$(printf '%s%s%s' "$key" "$label" "$RANDOM" | sha256sum | cut -c1-6)
+
+# Canonical is for comparing; what goes on disk must use the spelling
+# Hyprland actually matches (comma, mouse:272, ...).
+write_key="$("$KEYS" spell "$key")"
+
+{
+  printf '\n-- keysmith:begin %s\n' "$id"
+  (( replace )) && printf 'hl.unbind("%s")\n' "$write_key"
+  printf 'o.bind("%s", "%s", %s)\n' "$write_key" "$label" "$action"
+  printf -- '-- keysmith:end %s\n' "$id"
+} >>"$BINDINGS"
+
+reload
+phase=after
+after="$(configerrors)"
+
+if [[ "$after" == "$baseline" ]]; then
+  echo "$id"
+  exit 0
+fi
+
+printf '%s' "$saved" >"$BINDINGS"
+reload
+phase=restored
+restored="$(configerrors)"
+
+if [[ "$restored" == "$baseline" ]]; then
+  echo "rolled back: $BINDINGS" >&2
+  exit 3
+fi
+
+echo "ROLLBACK INCOMPLETE - inspect $BINDINGS by hand" >&2
+exit 4
