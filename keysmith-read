@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Emit the Keysmith catalog as a JSON array on stdout. Read-only.
+#
+# Three sources, three tiers (see DESIGN.md):
+#   hyprctl binds  -> authoritative map of what combos are TAKEN
+#   packaged Lua   -> verbatim action text, the only place it exists
+#   .desktop files -> apps that have no binding yet
+#
+# Actions cannot come from hyprctl: under Quattro every bind reports
+# `dispatcher: __lua` with an opaque callback handle.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+KEYS="$HERE/keysmith-keys"
+OMARCHY="${OMARCHY_PATH:-/usr/share/omarchy}"
+USER_BINDINGS="${KEYSMITH_BINDINGS:-$HOME/.config/hypr/bindings.lua}"
+
+# --- 1. taken combos -> "canonical<TAB>description" -----------------------
+binds_tsv() {
+  hyprctl binds 2>/dev/null | awk '
+    function flush() {
+      if (!seen) return; seen = 0
+      printf "%s\t%s\t%s\n", f["modmask"], f["key"], f["description"]
+    }
+    /^bind/ { flush(); seen = 1; delete f; next }
+    seen && match($0, /^\t[a-z]+: /) { f[substr($0, 2, RLENGTH - 3)] = substr($0, RLENGTH + 1) }
+    END { flush() }
+  ' | while IFS=$'\t' read -r mask key desc; do
+      [[ -z ${key:-} ]] && continue
+      # Some rows repeat the modifiers inside the key field, e.g.
+      # modmask=64 key="SUPER + code:10". modmask is authoritative, so keep
+      # only the final segment as the key. Dropping these rows entirely would
+      # hide every workspace binding from the conflict map.
+      key="${key##* + }"
+      canon=$("$KEYS" hypr "$mask" "$key" 2>/dev/null) || continue
+      printf '%s\t%s\n' "$canon" "${desc:-}"
+    done
+}
+
+# --- 2. action text -> "canonical<TAB>description<TAB>action" -------------
+# Only single-line o.bind calls. Loop-generated and multi-line calls are
+# deliberately unmatched: half-parsing them is worse than declaring them
+# non-rebindable.
+lua_tsv() {
+  cat "$OMARCHY"/default/hypr/bindings/*.lua "$USER_BINDINGS" 2>/dev/null |
+    sed -nE 's/^[[:space:]]*o\.bind\("([^"]*)"[[:space:]]*,[[:space:]]*"([^"]*)"[[:space:]]*,[[:space:]]*(.*)\)[[:space:]]*$/\1\t\2\t\3/p' |
+    while IFS=$'\t' read -r key desc action; do
+      [[ -z ${key:-} || -z ${action:-} ]] && continue
+      canon=$("$KEYS" lua "$key" 2>/dev/null) || continue
+      printf '%s\t%s\t%s\n' "$canon" "$desc" "$action"
+    done
+}
+
+# --- 3. installed apps -> "name<TAB>exec" ---------------------------------
+apps_tsv() {
+  for d in /usr/share/applications "$HOME/.local/share/applications"; do
+    [[ -d $d ]] || continue
+    for f in "$d"/*.desktop; do
+      [[ -f $f ]] || continue
+      grep -qi '^NoDisplay=true' "$f" && continue
+      grep -qi '^Type=Application' "$f" || continue
+      name=$(sed -n 's/^Name=//p' "$f" | head -1)
+      exec_=$(sed -n 's/^Exec=//p' "$f" | head -1 | sed 's/ *%[a-zA-Z]//g')
+      [[ -z ${name:-} || -z ${exec_:-} ]] && continue
+      printf '%s\t%s\n' "$name" "$exec_"
+    done
+  done | sort -u -t$'\t' -k1,1
+}
+
+b=$(binds_tsv); a=$(lua_tsv); p=$(apps_tsv)
+
+jq -n --arg binds "$b" --arg acts "$a" --arg apps "$p" '
+  def rows($s): $s | split("\n") | map(select(length > 0) | split("\t"));
+
+  (rows($acts) | map({ key: .[0], value: .[2] }) | from_entries) as $actmap
+
+  | (rows($binds) | map({
+      label:      (if (.[1] // "") == "" then .[0] else .[1] end),
+      key:        .[0],
+      source:     "binding",
+      action:     ($actmap[.[0]] // null),
+      rebindable: ($actmap[.[0]] != null)
+    })) as $B
+
+  # Executable basenames already spoken for by some binding.
+  | ($B | map(.action // "")
+        | join(" ")) as $boundtext
+
+  | (rows($apps) | map({
+      label:      .[0],
+      key:        null,
+      source:     "app",
+      action:     .[1],
+      rebindable: true,
+      base:       (.[1] | split(" ")[0] | split("/") | last)
+    })
+    | map(. as $r | select($r.base != "" and (($boundtext | contains($r.base)) | not)))
+    | map(del(.base))) as $P
+
+  | $B + $P
+'

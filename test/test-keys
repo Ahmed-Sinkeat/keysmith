@@ -28,6 +28,13 @@ check "SUPER + DELETE"     hypr 64 DELETE
 check "SUPER + DELETE"     lua "SUPER + Delete"
 # mouse and scancode forms have no case and must pass through untouched
 check "SUPER + mouse:272"  hypr 64 "mouse:272"
+# Hyprland's code:N number row must equal the digit a keypress produces, or
+# every workspace binding looks free. code:10 is "1" ... code:19 is "0".
+check "SUPER + 1"          hypr 64 "code:10"
+check "SUPER + 9"          hypr 64 "code:18"
+check "SUPER + 0"          hypr 64 "code:19"
+check "SUPER + 1"          qt 49 268435456
+check "SUPER + SHIFT + code:201" lua "SUPER + SHIFT + code:201"
 
 # spell: canonical -> what is safe to WRITE into bindings.lua
 check "SUPER + comma"          spell "SUPER + COMMA"

@@ -26,8 +26,15 @@ backslash bracketleft bracketright "
 
 canon_key() {
   local k="$1"
-  # Mouse and raw scancode forms have no case at all - pass them through.
   case "${k,,}" in
+    # Hyprland's code:N is evdev+8. The number row is the only place Omarchy
+    # uses it in bulk (every workspace binding), and a captured digit must
+    # compare equal to it or SUPER+1 looks free when it is not.
+    # ponytail: number row only; other code:N stays literal, which still
+    # detects code-vs-code conflicts. Widen via xkbcli if that ever matters.
+    code:1[0-9])
+      local n="${k#[Cc][Oo][Dd][Ee]:}"
+      printf '%s' "$(( n == 19 ? 0 : n - 9 ))"; return ;;
     mouse:*|mouse_*|code:*) printf '%s' "${k,,}"; return ;;
   esac
   printf '%s' "${k^^}"
