@@ -90,7 +90,7 @@ jq -n --arg binds "$b" --arg acts "$a" --arg apps "$p" '
       label:      .[0],
       key:        null,
       source:     "app",
-      action:     .[1],
+      action:     ("{ launch = \"" + .[1] + "\" }"),
       rebindable: true,
       base:       (.[1] | split(" ")[0] | split("/") | last)
     })

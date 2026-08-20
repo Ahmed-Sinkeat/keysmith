@@ -48,6 +48,13 @@ Read this before changing anything. Every line here was earned, not assumed.
   (`enabled`, `window`, readonly `active`). Confirmed capturing `SUPER+SPACE`
   and `SUPER+SHIFT+W` with Hyprland's own binds fully suppressed.
   No submaps, no evdev, no elevated permissions.
+- A hot reload swaps the plugin component but **does not replace an overlay
+  window that is already open**. Editing while the overlay is up leaves the
+  live instance running the old code, which looks exactly like the edit having
+  no effect. Close the overlay before testing an edit; if in doubt,
+  `omarchy-restart-shell`.
+- Plugin `console.log` does not reach `journalctl`. To trace, run a `Process`
+  that appends to a file.
 - `nativeScanCode` is unreliable — it came back as a constant `9` for every
   key under `wtype`. Map `Qt::Key` + modifiers to Hyprland key names via a
   lookup table. Re-check against a physical keypress before trusting it.
