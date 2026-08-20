@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "sinkeat.keysmith",
+  "name": "Keysmith",
+  "version": "0.1.0",
+  "author": "Ahmed-Sinkeat",
+  "license": "MIT",
+  "description": "Rebind Omarchy keyboard shortcuts without editing config files",
+  "kinds": ["overlay"],
+  "entryPoints": { "overlay": "Keysmith.qml" }
+}
