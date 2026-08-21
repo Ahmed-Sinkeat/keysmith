@@ -71,21 +71,54 @@ case "${1:-}" in
       59)       key=semicolon ;;
       96)       key=grave ;;
       16777216) key=escape ;;
-      16777220) key=return ;;
-      16777217) key=tab ;;
+      16777217|16777218) key=tab ;;      # Tab / Backtab
       16777219) key=backspace ;;
+      16777220|16777221) key=return ;;   # Return / keypad Enter
+      16777222) key=insert ;;
       16777223) key=delete ;;
+      16777224) key=pause ;;
+      16777225) key=print ;;
+      16777226) key=Sys_Req ;;
+      16777227) key=clear ;;
       16777232) key=home ;;
       16777233) key=end ;;
       16777234) key=left ;;
       16777235) key=up ;;
       16777236) key=right ;;
       16777237) key=down ;;
+      16777238) key=Page_Up ;;
+      16777239) key=Page_Down ;;
+      16777301) key=menu ;;
+      16777304) key=help ;;
+
+      # Qt multimedia keys -> the XF86 keysyms used by Omarchy's defaults.
+      16777328) key=XF86AudioLowerVolume ;;
+      16777329) key=XF86AudioMute ;;
+      16777330) key=XF86AudioRaiseVolume ;;
+      16777344|16777350) key=XF86AudioPlay ;;
+      16777345) key=XF86AudioStop ;;
+      16777346) key=XF86AudioPrev ;;
+      16777347) key=XF86AudioNext ;;
+      16777348) key=XF86AudioRecord ;;
+      16777349) key=XF86AudioPause ;;
+      16777394) key=XF86MonBrightnessUp ;;
+      16777395) key=XF86MonBrightnessDown ;;
+      16777396) key=XF86KbdLightOnOff ;;
+      16777397) key=XF86KbdBrightnessUp ;;
+      16777398) key=XF86KbdBrightnessDown ;;
+      16777399) key=XF86PowerOff ;;
+      16777400) key=XF86WakeUp ;;
+      16777401) key=XF86Eject ;;
+      16777419) key=XF86Calculator ;;
+      16777488) key=XF86TouchpadToggle ;;
+      16777489) key=XF86TouchpadOn ;;
+      16777490) key=XF86TouchpadOff ;;
+      16777491) key=XF86AudioMicMute ;;
       *)
         if (( k >= 33 && k <= 126 )); then
           # Printable ASCII: Qt::Key_A is 0x41, matching the character code.
           key=$(printf "\\$(printf '%03o' "$k")")
-        elif (( k >= 16777264 && k <= 16777275 )); then
+        elif (( k >= 16777264 && k <= 16777298 )); then
           key="F$(( k - 16777263 ))"
         else
           exit 1

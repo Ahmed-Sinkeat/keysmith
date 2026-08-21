@@ -1,68 +1,145 @@
 #!/usr/bin/env bash
-# The two assertions that matter most here are "pre-existing error does not
-# roll back" and "second reload issued after restore". Everything else is
-# scaffolding around proving those.
+# The assertions that matter most here are "old key is unbound" (a rebind is a
+# move, not an addition), "bytes restored exactly" (compared with cmp against a
+# real file copy - command substitution strips trailing newlines and cannot see
+# its own bug), and "second reload issued after restore".
 set -uo pipefail
 W="$(cd "$(dirname "$0")/.." && pwd)/keysmith-write"
 fail=0
 say() { if [[ $1 == 0 ]]; then echo "ok   $2"; else echo "FAIL $2"; fail=1; fi }
+owned_block() {
+  awk -v id="$1" '
+    $0 == "-- keysmith:begin " id { inside=1 }
+    inside { print }
+    $0 == "-- keysmith:end " id { exit }
+  ' "$KEYSMITH_BINDINGS"
+}
 
 tmp=$(mktemp -d)
 export KEYSMITH_BINDINGS="$tmp/bindings.lua"
 export KEYSMITH_RELOAD_LOG="$tmp/reloads"
 export KEYSMITH_DRYRUN=1
+export KEYSMITH_FAKE_BASELINE=""
+export KEYSMITH_FAKE_AFTER=""
+export KEYSMITH_FAKE_RESTORED=""
 printf -- '-- user bindings\n' > "$KEYSMITH_BINDINGS"
 
-# --- 1. free key: o.bind only, wrapped in owned markers -------------------
-KEYSMITH_TAKEN="" "$W" "SUPER + SHIFT + V" "Code" '{ launch = "code" }' >/dev/null 2>&1
-say $? "free key writes successfully"
+# 1. New app on a free key: bind only.
+KEYSMITH_TAKEN="" "$W" "SUPER + SHIFT + V" "" "Code" '{ launch = "code" }' >/dev/null 2>&1
+say $? "free app binding writes successfully"
 grep -q 'keysmith:begin' "$KEYSMITH_BINDINGS"; say $? "block markers written"
-grep -q 'keysmith:end' "$KEYSMITH_BINDINGS"; say $? "closing marker written"
-grep -qF 'o.bind("SUPER + SHIFT + V", "Code", { launch = "code" })' "$KEYSMITH_BINDINGS"
-say $? "o.bind emitted verbatim"
-! grep -q 'hl.unbind' "$KEYSMITH_BINDINGS"; say $? "no unbind for a free key"
+grep -qF 'o.bind("SUPER + SHIFT + V", "Code", { launch = "code" })' "$KEYSMITH_BINDINGS"; say $? "o.bind emitted verbatim"
+! grep -q 'hl.unbind' "$KEYSMITH_BINDINGS"; say $? "no unbind when app had no old key"
 
-# --- 2. taken key without --replace refuses, exit 2, file untouched -------
-before=$(cat "$KEYSMITH_BINDINGS")
-KEYSMITH_TAKEN="SUPER + SHIFT + W" "$W" "SUPER + SHIFT + W" "Typora" '"typora"' >/dev/null 2>&1
-[[ $? -eq 2 ]]; say $? "refuses taken key with exit 2"
-[[ "$(cat "$KEYSMITH_BINDINGS")" == "$before" ]]; say $? "file untouched on refusal"
+# 2. Taken destination without --replace refuses and leaves bytes untouched.
+cp "$KEYSMITH_BINDINGS" "$tmp/before"
+KEYSMITH_TAKEN="SUPER + SHIFT + W" "$W" "SUPER + SHIFT + W" "" "Typora" '"typora"' >/dev/null 2>&1
+[[ $? -eq 2 ]]; say $? "refuses taken destination with exit 2"
+cmp -s "$KEYSMITH_BINDINGS" "$tmp/before"; say $? "file untouched on refusal"
 
-# --- 3. taken key with --replace emits unbind immediately before bind -----
-KEYSMITH_TAKEN="SUPER + SHIFT + W" "$W" "SUPER + SHIFT + W" "Typora" '"typora"' --replace >/dev/null 2>&1
+# 3. New app replacing a taken destination: unbind destination, then bind.
+KEYSMITH_TAKEN="SUPER + SHIFT + W" "$W" "SUPER + SHIFT + W" "" "Typora" '"typora"' --replace >/dev/null 2>&1
 say $? "replace succeeds"
-grep -A1 'hl.unbind("SUPER + SHIFT + W")' "$KEYSMITH_BINDINGS" | grep -qF 'o.bind("SUPER + SHIFT + W"'
-say $? "unbind emitted immediately before bind"
+grep -A1 'hl.unbind("SUPER + SHIFT + W")' "$KEYSMITH_BINDINGS" | grep -qF 'o.bind("SUPER + SHIFT + W"'; say $? "taken destination unbound immediately before bind"
 
-# --- 4. the key is written in SAFE spelling, not canonical ---------------
-KEYSMITH_TAKEN="" "$W" "SUPER + COMMA" "Notes" '"notes"' >/dev/null 2>&1
-grep -qF 'o.bind("SUPER + comma"' "$KEYSMITH_BINDINGS"
-say $? "canonical COMMA written back as lowercase comma"
+# 4. Rebinding an existing action MOVES it: old key is unbound even if the
+#    destination is free. This is the semantic bug the old writer missed.
+close_id=$(KEYSMITH_TAKEN="" "$W" "SUPER + Q" "SUPER + W" "Close window" 'hl.dsp.window.close()' 2>/dev/null)
+say $? "existing binding can move to a free key"
+owned_block "$close_id" | grep -qF 'hl.unbind("SUPER + W")'; say $? "old key is unbound"
+owned_block "$close_id" | grep -qF 'o.bind("SUPER + Q", "Close window", hl.dsp.window.close())'; say $? "action rebound under new key"
 
-# --- 5. a PRE-EXISTING config error must NOT trigger rollback ------------
-unset KEYSMITH_DRYRUN
+# 5. A later move updates the SAME owned action block and retains every key it
+#    previously disabled. Defaults must not reappear when the old block goes.
+moved_id=$(KEYSMITH_TAKEN="SUPER + E" "$W" "SUPER + E" "SUPER + Q" "Close window" 'hl.dsp.window.close()' --replace 2>/dev/null)
+[[ $moved_id == "$close_id" ]]; say $? "same action keeps a stable owned block"
+[[ $(grep -cF -- "-- keysmith:begin $close_id" "$KEYSMITH_BINDINGS") -eq 1 ]]; say $? "later change replaces rather than stacks owned block"
+block=$(owned_block "$close_id")
+[[ "$block" == *'hl.unbind("SUPER + W")'* && "$block" == *'hl.unbind("SUPER + Q")'* && "$block" == *'hl.unbind("SUPER + E")'* ]]; say $? "updated block retains historical and destination unbinds"
+[[ "$block" == *'o.bind("SUPER + E", "Close window", hl.dsp.window.close())'* ]]; say $? "updated block binds the new key"
+
+# 6. Remove updates that block again: all historical keys stay disabled and no
+#    replacement bind remains. It is removal, not reset-to-default.
+removed_id=$("$W" remove "SUPER + E" "Close window" 'hl.dsp.window.close()' 2>/dev/null)
+[[ $? -eq 0 && $removed_id == "$close_id" ]]; say $? "remove succeeds against the owned action"
+[[ $(grep -cF -- "-- keysmith:begin $close_id" "$KEYSMITH_BINDINGS") -eq 1 ]]; say $? "remove still owns one block"
+block=$(owned_block "$close_id")
+[[ "$block" == *'hl.unbind("SUPER + W")'* && "$block" == *'hl.unbind("SUPER + Q")'* && "$block" == *'hl.unbind("SUPER + E")'* ]]; say $? "remove keeps defaults and prior keys disabled"
+! grep -qF 'o.bind(' <<<"$block"; say $? "remove leaves the action unbound"
+
+# 7. A removed action can be added again without losing its removal history.
+readded_id=$(KEYSMITH_TAKEN="" "$W" "SUPER + R" "" "Close window" 'hl.dsp.window.close()' 2>/dev/null)
+[[ $? -eq 0 && $readded_id == "$close_id" ]]; say $? "removed action can be added again"
+block=$(owned_block "$close_id")
+[[ "$block" == *'o.bind("SUPER + R", "Close window", hl.dsp.window.close())'* ]]; say $? "re-added action owns its new key"
+[[ $(grep -cF -- "-- keysmith:begin $close_id" "$KEYSMITH_BINDINGS") -eq 1 ]]; say $? "re-add does not stack another block"
+
+# 8. Canonical keys are converted back to safe xkbcommon spelling for BOTH
+#    the old unbind and the new bind.
+KEYSMITH_TAKEN="" "$W" "SUPER + SHIFT + COMMA" "SUPER + COMMA" "Notes" '"notes"' >/dev/null 2>&1
+block=$(tail -n 4 "$KEYSMITH_BINDINGS")
+[[ "$block" == *'hl.unbind("SUPER + comma")'* ]]; say $? "old canonical COMMA written lowercase"
+[[ "$block" == *'o.bind("SUPER + SHIFT + comma"'* ]]; say $? "new canonical COMMA written lowercase"
+
+# 9. Labels are escaped as Lua string data.
+KEYSMITH_TAKEN="" "$W" "SUPER + ALT + N" "" 'Say "Hi"' '"thing"' >/dev/null 2>&1
+tail -n 3 "$KEYSMITH_BINDINGS" | grep -qF '"Say \"Hi\""'; say $? "label quotes are escaped"
+
+# 10. Failure to read the conflict map refuses before touching the file.
+cp "$KEYSMITH_BINDINGS" "$tmp/before-unavailable"
+unset KEYSMITH_TAKEN KEYSMITH_FAKE_BASELINE KEYSMITH_FAKE_AFTER KEYSMITH_FAKE_RESTORED
+KEYSMITH_HYPRCTL=/bin/false "$W" "SUPER + ALT + U" "" "Unavailable" '"thing"' >/dev/null 2>&1
+[[ $? -eq 5 ]]; say $? "failed conflict scan exits 5"
+cmp -s "$KEYSMITH_BINDINGS" "$tmp/before-unavailable"; say $? "failed conflict scan leaves bytes untouched"
+
+# 11. Failure to query the baseline also refuses before touching the file.
+KEYSMITH_TAKEN="" KEYSMITH_HYPRCTL=/bin/false "$W" "SUPER + ALT + U" "" "Unavailable" '"thing"' >/dev/null 2>&1
+[[ $? -eq 5 ]]; say $? "failed baseline query exits 5"
+cmp -s "$KEYSMITH_BINDINGS" "$tmp/before-unavailable"; say $? "failed baseline query leaves bytes untouched"
+
+# 12. A reload failure restores the file, reloads the restored config, and
+#     reports a verification failure rather than success.
+export KEYSMITH_FAKE_BASELINE=""
+export KEYSMITH_FAKE_RESTORED=""
+: > "$KEYSMITH_RELOAD_LOG"
+KEYSMITH_TAKEN="" KEYSMITH_FAKE_RELOAD_FAIL_AT=1 "$W" "SUPER + ALT + U" "" "Unavailable" '"thing"' >/dev/null 2>&1
+[[ $? -eq 6 ]]; say $? "failed apply reload exits 6"
+cmp -s "$KEYSMITH_BINDINGS" "$tmp/before-unavailable"; say $? "failed apply reload restores bytes"
+[[ $(wc -l < "$KEYSMITH_RELOAD_LOG") -ge 2 ]]; say $? "failed apply reload reloads restored config"
+
+# 13. A PRE-EXISTING config error must not trigger rollback.
+# Keep reload isolated: reload logging happens before the dry-run return, so
+# the runtime-restore assertion below still exercises both reload calls.
+export KEYSMITH_DRYRUN=1
 export KEYSMITH_FAKE_BASELINE="pre-existing error"
 export KEYSMITH_FAKE_AFTER="pre-existing error"
-KEYSMITH_TAKEN="" "$W" "SUPER + ALT + J" "Thing" '"thing"' >/dev/null 2>&1
+unset KEYSMITH_FAKE_RESTORED
+KEYSMITH_TAKEN="" "$W" "SUPER + ALT + J" "" "Thing" '"thing"' >/dev/null 2>&1
 [[ $? -eq 0 ]]; say $? "pre-existing error does not roll back"
 grep -q 'SUPER + ALT + J' "$KEYSMITH_BINDINGS"; say $? "write survived pre-existing error"
 
-# --- 6. a NEW error rolls back AND reloads a second time -----------------
+# 14. A NEW error rolls back byte-for-byte, including trailing blank lines, and
+#    reloads a second time to restore Hyprland runtime state.
+unset KEYSMITH_FAKE_RESTORED
 export KEYSMITH_FAKE_BASELINE=""
 export KEYSMITH_FAKE_AFTER="new error"
+printf '\n\n' >> "$KEYSMITH_BINDINGS"
+chmod 640 "$KEYSMITH_BINDINGS"
+touch -t 202401020304.05 "$KEYSMITH_BINDINGS"
+cp "$KEYSMITH_BINDINGS" "$tmp/exact-before"
+metadata_before=$(stat -c '%a:%Y' "$KEYSMITH_BINDINGS")
 : > "$KEYSMITH_RELOAD_LOG"
-before=$(cat "$KEYSMITH_BINDINGS")
-KEYSMITH_TAKEN="" "$W" "SUPER + ALT + K" "Bad" '"bad"' >/dev/null 2>&1
+KEYSMITH_TAKEN="" "$W" "SUPER + ALT + K" "" "Bad" '"bad"' >/dev/null 2>&1
 [[ $? -eq 3 ]]; say $? "new error exits 3"
-[[ "$(cat "$KEYSMITH_BINDINGS")" == "$before" ]]; say $? "bytes restored exactly"
-[[ $(wc -l < "$KEYSMITH_RELOAD_LOG") -ge 2 ]]
-say $? "second reload issued after restore (runtime state undone, not just disk)"
+cmp -s "$KEYSMITH_BINDINGS" "$tmp/exact-before"; say $? "bytes restored exactly, trailing newlines included"
+[[ $(stat -c '%a:%Y' "$KEYSMITH_BINDINGS") == "$metadata_before" ]]; say $? "file mode and timestamp restored"
+[[ $(wc -l < "$KEYSMITH_RELOAD_LOG") -ge 2 ]]; say $? "second reload issued after restore"
 
-# --- 7. rollback that fails to restore baseline reports exit 4 -----------
+# 15. Rollback that fails to restore baseline reports exit 4.
 export KEYSMITH_FAKE_BASELINE=""
 export KEYSMITH_FAKE_AFTER="new error"
 export KEYSMITH_FAKE_RESTORED="still broken"
-KEYSMITH_TAKEN="" "$W" "SUPER + ALT + L" "Worse" '"worse"' >/dev/null 2>&1
+KEYSMITH_TAKEN="" "$W" "SUPER + ALT + L" "" "Worse" '"worse"' >/dev/null 2>&1
 [[ $? -eq 4 ]]; say $? "incomplete rollback exits 4 instead of claiming success"
 
 rm -rf "$tmp"

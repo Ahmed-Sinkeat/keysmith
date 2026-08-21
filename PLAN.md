@@ -2,7 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A Quickshell overlay for Omarchy 4 that rebinds a keyboard shortcut without opening a text editor, warning first when the combination is already taken.
+**Goal:** A Quickshell overlay for Omarchy 4 that adds shortcuts to installed
+apps, changes existing shortcuts, and removes shortcuts without opening a text
+editor, warning first when a combination is already taken.
+
+**Status:** The original add/change implementation below is complete. The
+active Add/Change/Remove product plan is under "Phase 2" at the end of this
+file; the unchecked original steps are retained as implementation history.
 
 **Architecture:** Three separable pieces. Shell scripts own everything that reads or writes config (`keysmith-read`, `keysmith-write`, `keysmith-keys`); QML owns only presentation and key capture. The overlay never parses or writes Lua. Key normalization lives in exactly one place — `keysmith-keys` — because a conflict that exists but compares unequal is the one bug that discredits the tool.
 
@@ -1040,9 +1046,61 @@ git push
   Normalization → Task 2. Conflict detection → Tasks 3 and 5. Capture → Task 6.
   Writer with markers and baseline rollback → Task 4. Distribution → README in
   Task 7, registry submission is post-v1 and out of scope here.
-- **Deliberately deferred.** Remove and reset are *next*, not cut — the block
-  markers land in Task 4 precisely so that work needs no heuristics later.
-  Apps/System split stays deferred pending real use.
+- **Deliberately deferred.** Undo and reset-to-default remain out of the first
+  complete product. Remove is handled by Phase 2 below. Apps remain a
+  first-class Add target in the shared searchable list.
 - **Known soft spot.** The `is_taken` path in `keysmith-write` shells out to
   `keysmith-read`, which is slow for a single lookup. Acceptable at one call
   per save. `# ponytail:` pass the catalog in if it ever feels sluggish.
+
+---
+
+## Phase 2: complete the product loop
+
+Agreed interaction contract:
+
+- Enter is the primary action: Add when no key exists, Change when one does.
+- Right Arrow or a visible More button opens contextual actions.
+- Remove lives in More and requires confirmation. There is no global Delete
+  shortcut and no action available only through right-click.
+- Remove means leave the item unbound. It is not reset-to-default.
+- Escape goes back one state at a time and remains first in capture handling.
+
+### Task 8: Record the product contract
+
+- [x] Define Add, Change, Replace, and Remove in `DESIGN.md`.
+- [x] Keep installed applications as first-class Add targets.
+- [x] Update the README and manifest language to describe the complete product.
+
+### Task 9: Removal state and catalog continuity
+
+**Files:** `keysmith-write`, `keysmith-read`, `test/test-write`, `test/test-read`.
+
+- [x] Add a writer remove operation using the same baseline, reload, verify,
+  rollback, byte, mode, and timestamp guarantees as Add/Change.
+- [x] Update a matching Keysmith-owned action block instead of growing a new
+  block for every later Change or Remove.
+- [x] Never delete arbitrary handwritten Lua or packaged defaults.
+- [x] Keep parseable removed actions in the catalog as unbound Add targets.
+- [x] Protect multi-action keys from key-only removal.
+
+### Task 10: Contextual actions UI
+
+**File:** `Keysmith.qml`.
+
+- [x] Add mouse selection to result rows.
+- [x] Show visible Add/Change and More controls for the current row.
+- [x] Open More with Right Arrow or mouse; close it with Left Arrow or Escape.
+- [x] Offer Change, Remove, and Open bindings.lua as applicable.
+- [x] Confirm Remove on a separate screen before calling the writer.
+- [x] After Add, Change, or Remove, briefly state exactly what changed.
+
+### Task 11: Verification
+
+- [x] Run reader, writer, and key-normalization regression suites.
+- [x] Run `qmllint`, `omarchy plugin validate .`, shell syntax checks, and
+  `git diff --check`.
+- [x] Exercise Add, Change, conflict Replace, and Remove in the live overlay
+  with a reversible binding, then restore the original config exactly.
+- [x] Confirm the More menu and Escape state transitions by keyboard, and
+  verify visible mouse hit targets for rows and controls.

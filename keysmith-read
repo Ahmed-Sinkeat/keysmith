@@ -14,10 +14,17 @@ HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 KEYS="$HERE/keysmith-keys"
 OMARCHY="${OMARCHY_PATH:-/usr/share/omarchy}"
 USER_BINDINGS="${KEYSMITH_BINDINGS:-$HOME/.config/hypr/bindings.lua}"
+HYPRCTL="${KEYSMITH_HYPRCTL:-hyprctl}"
 
 # --- 1. taken combos -> "canonical<TAB>description" -----------------------
 binds_tsv() {
-  hyprctl binds 2>/dev/null | awk '
+  local raw
+  if ! raw=$("$HYPRCTL" binds 2>/dev/null); then
+    echo "keysmith: unable to read Hyprland bindings" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$raw" | awk '
     function flush() {
       if (!seen) return; seen = 0
       printf "%s\t%s\t%s\n", f["modmask"], f["key"], f["description"]
@@ -42,7 +49,14 @@ binds_tsv() {
 # deliberately unmatched: half-parsing them is worse than declaring them
 # non-rebindable.
 lua_tsv() {
-  cat "$OMARCHY"/default/hypr/bindings/*.lua "$USER_BINDINGS" 2>/dev/null |
+  local files=()
+  shopt -s nullglob
+  files=("$OMARCHY"/default/hypr/bindings/*.lua)
+  shopt -u nullglob
+  [[ -f $USER_BINDINGS ]] && files+=("$USER_BINDINGS")
+  ((${#files[@]} > 0)) || return 0
+
+  cat -- "${files[@]}" |
     sed -nE 's/^[[:space:]]*o\.bind\("([^"]*)"[[:space:]]*,[[:space:]]*"([^"]*)"[[:space:]]*,[[:space:]]*(.*)\)[[:space:]]*$/\1\t\2\t\3/p' |
     while IFS=$'\t' read -r key desc action; do
       [[ -z ${key:-} || -z ${action:-} ]] && continue
@@ -67,35 +81,83 @@ apps_tsv() {
   done | sort -u -t$'\t' -k1,1
 }
 
-b=$(binds_tsv); a=$(lua_tsv); p=$(apps_tsv)
+b=$(binds_tsv) || exit 1
+a=$(lua_tsv) || { echo "keysmith: unable to read binding actions" >&2; exit 1; }
+p=$(apps_tsv)
 
 jq -n --arg binds "$b" --arg acts "$a" --arg apps "$p" '
   def rows($s): $s | split("\n") | map(select(length > 0) | split("\t"));
 
-  (rows($acts) | map({ key: .[0], value: .[2] }) | from_entries) as $actmap
+  (rows($acts)) as $A
 
-  | (rows($binds) | map({
-      label:      (if (.[1] // "") == "" then .[0] else .[1] end),
-      key:        .[0],
-      source:     "binding",
-      action:     ($actmap[.[0]] // null),
-      rebindable: ($actmap[.[0]] != null)
-    })) as $B
+  # A key may legitimately own more than one action: ALT+TAB has two press
+  # actions and F9 has distinct press/release actions. Match the description
+  # so the catalog still reports the correct action. Such rows are deliberately
+  # non-rebindable, though: hl.unbind accepts only a key and would remove every
+  # sibling action while Keysmith moved just the selected one.
+  | (rows($binds)) as $L
+  | ($L | map(
+      . as $bind
+      | ($L | map(select(.[0] == $bind[0]))) as $liveByKey
+      | ($A | map(select(.[0] == $bind[0]))) as $byKey
+      | ($byKey | map(select(.[1] == ($bind[1] // "")))) as $byDescription
+      | (if ($byDescription | length) == 1 then $byDescription[0][2]
+         elif ($byKey | length) == 1 then $byKey[0][2]
+         else null
+         end) as $action
+      | {
+          label:      (if ($bind[1] // "") == "" then $bind[0] else $bind[1] end),
+          key:        $bind[0],
+          source:     "binding",
+          action:     $action,
+          rebindable: ($action != null and ($liveByKey | length) == 1)
+        }
+    )) as $B
 
-  # Executable basenames already spoken for by some binding.
-  | ($B | map(.action // "")
-        | join(" ")) as $boundtext
+  # Definitions still present in Lua but absent from the live binding map are
+  # actions with no shortcut. This is how a removed default remains searchable
+  # and can be Added again later. Identity is label+opaque action, matching the
+  # the stable owned-block identity used by the writer.
+  | ($A
+    | unique_by([.[1], .[2]])
+    | map(
+        . as $definition
+        | select(
+            ($B | any(
+              .label == (if ($definition[1] // "") == "" then $definition[0] else $definition[1] end)
+              and .action == $definition[2]
+            )) | not
+          )
+        | {
+            label:      (if (.[1] // "") == "" then .[0] else .[1] end),
+            key:        null,
+            source:     "action",
+            action:     .[2],
+            rebindable: true
+          }
+      )) as $U
+
+  # Executable basenames already spoken for by some binding. Split into words
+  # rather than substring-matching: a short basename like "code" occurs inside
+  # plenty of unrelated action text, and hiding an installed app because of a
+  # coincidental substring is a silent wrong answer.
+  | (($B + $U) | map(.action // "")
+        | join(" ")
+        | [splits("[^A-Za-z0-9_.+-]+")]) as $boundwords
 
   | (rows($apps) | map({
       label:      .[0],
       key:        null,
       source:     "app",
-      action:     ("{ launch = \"" + .[1] + "\" }"),
+      # Exec is arbitrary text from a .desktop file and goes inside a Lua
+      # string. @json quotes and escapes it; hand-built quotes let an Exec
+      # containing " or \ emit Lua that does not parse.
+      action:     ("{ launch = " + (.[1] | @json) + " }"),
       rebindable: true,
       base:       (.[1] | split(" ")[0] | split("/") | last)
     })
-    | map(. as $r | select($r.base != "" and (($boundtext | contains($r.base)) | not)))
+    | map(. as $r | select($r.base != "" and (($boundwords | index($r.base)) == null)))
     | map(del(.base))) as $P
 
-  | $B + $P
+  | $B + $U + $P
 '

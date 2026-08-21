@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "author": "Ahmed-Sinkeat",
   "license": "MIT",
-  "description": "Rebind Omarchy keyboard shortcuts without editing config files",
+  "description": "Add, change, and remove Omarchy shortcuts without editing config files",
   "kinds": ["overlay"],
   "entryPoints": { "overlay": "Keysmith.qml" }
 }

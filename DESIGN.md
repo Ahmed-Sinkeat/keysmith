@@ -22,20 +22,30 @@ That is the whole problem this solves.
 
 ## What it is
 
-A Quickshell overlay plugin. You open it, search for the thing you want a key
-for, press the keys, and it writes the binding — warning you first if something
-already owns that combination.
+A Quickshell overlay plugin for adding, changing, and removing shortcuts. You
+open it, search for an existing action or installed app, and choose what to do.
+Adding or changing captures the keys and warns before replacing anything that
+already owns the combination. Removing leaves the selected item unbound.
+
+### Product language
+
+- **Add** assigns a shortcut to an installed app or action that is not bound.
+- **Change** moves a bound action or app from its current key to a new one.
+- **Replace** is conflict resolution: the new key already belongs to something
+  else, and confirming disables that destination before assigning it.
+- **Remove** leaves the selected action or app with no shortcut. It does not
+  mean reset or restore an Omarchy default.
 
 ## Non-goals
 
 - Not a keybinding viewer. `SUPER+K` already does that and stays untouched.
-- Not an auto-configurator. Quattro already ships bindings for the apps people
-  want; adding them again has no value.
+- Not an auto-configurator. Keysmith only adds an app shortcut when the user
+  explicitly selects that installed app and records a key.
 - Not a replacement for the editor. Opening the file stays available as a row.
 - Not custom shell commands in v1. That needs typing, which defeats the point.
 
-Removing and resetting bindings are wanted and planned — they follow once add
-and replace work end to end. See "Decided".
+Reset-to-default and undo are not part of the first complete product. Remove is
+part of it and has deliberately different semantics: no shortcut remains.
 
 ## Insertion point
 
@@ -61,7 +71,7 @@ Three pieces, each independently testable.
 |---|---|---|
 | **Reader** | Enumerate what exists: current bindings + installed apps | shell script → JSON |
 | **Overlay** | Search, select, capture keypress, show conflicts | QML |
-| **Writer** | Append the `hl.unbind` / `o.bind` pair, reload, verify | shell script |
+| **Writer** | Add, change, or remove an owned binding state; reload and verify | shell script |
 
 The overlay never edits files directly and never parses Lua. It calls the
 reader on open and the writer on save. Keeping Lua handling in one script means
@@ -96,6 +106,8 @@ So the reader has three sources and produces three tiers:
 | `.desktop` entries | apps with no binding | **addable** |
 
 Row: `{ label, canonicalKey|null, source, actionText|null, rebindable }`.
+Parseable actions that have been removed remain in the catalog with a null key,
+so removal is not a one-way disappearance and they can be added again later.
 
 **Not everything is rebindable, and that is fine.** `tiling.lua` generates the
 workspace bindings in `for` loops and a few calls span multiple lines, so a
@@ -162,7 +174,20 @@ Single screen:
    Open bindings.lua in editor
 ```
 
-Select a row → capture mode → confirm → writer runs.
+The common path stays direct: select a row and press Enter to Add or Change.
+Secondary actions live in a visible contextual More menu, opened with Right
+Arrow or a mouse click. Remove is there rather than on a global Delete key.
+
+```
+   Terminal                    ·  SUPER + RETURN
+
+   [ Change · Enter ]       [ More… · Right Arrow ]
+```
+
+For a bound, safely editable row the More menu contains Change shortcut,
+Remove shortcut, and Open bindings.lua. Remove always has a separate explicit
+confirmation. Unbound apps say Add instead of Change. Mouse and keyboard invoke
+the same actions; none are available only through right-click.
 
 Conflict is the load-bearing state:
 
@@ -180,17 +205,20 @@ know about.
 Appends an **owned block** to `~/.config/hypr/bindings.lua`:
 
 ```lua
--- keysmith:begin 7f3a91
+-- keysmith:begin 7f3a91c42b0e
+-- keysmith:data <base64-encoded owned state>
 hl.unbind("SUPER + SHIFT + W")
 o.bind("SUPER + SHIFT + W", "Visual Studio Code", { launch = "code" })
--- keysmith:end 7f3a91
+-- keysmith:end 7f3a91c42b0e
 ```
 
-The markers exist from v1 even though nothing reads them until remove/reset
-ships. Removing an override then means deleting a delimited block Keysmith
-knows it wrote — never inferring intent from someone's hand-written Lua. Adding
-markers later would mean heuristics over user code, which is the failure mode
-worth spending four comment characters to avoid.
+The opaque data comment records the action identity, current state, and keys
+that must stay disabled. Together with the markers it lets Keysmith update the
+state it owns without deleting or rewriting someone's hand-written Lua.
+Removing a shortcut emits owned `hl.unbind(...)` state; it never deletes a
+packaged default or arbitrary user binding. Adding markers later would mean
+heuristics over user code, which is the failure mode worth spending four
+comment characters to avoid.
 
 `hl.unbind` is emitted only when the combo was actually bound.
 
@@ -284,9 +312,10 @@ Per project laws: cheap checks only.
 - `omarchy plugin validate ./<dir>` and `qmllint` on every QML file.
 - One assert-based script covering the writer, which is where the risk is:
   conflict → `hl.unbind` emitted; no conflict → `o.bind` only; block markers
-  present and matched; **pre-existing `configerrors` does not trigger rollback**;
-  new error → bytes restored *and* a second reload issued. That last pair is the
-  point of the test.
+  present and matched; remove → selected action is left unbound; repeated
+  operations update owned state; **pre-existing `configerrors` does not trigger
+  rollback**; new error → bytes restored *and* a second reload issued. That last
+  pair is the point of the test.
 - One assert covering normalization: `modmask`+keysym, `"SUPER + SHIFT + W"`,
   and a captured `Qt::Key` all collapse to the same canonical string, and
   `comma` never becomes `COMMA`.
@@ -300,8 +329,10 @@ Per project laws: cheap checks only.
   draw controls with plain QtQuick. Exception only for a single component that
   saves disproportionate work. Keeps a future break a restyle, not a rewrite.
 
-- **Apps/System split — deferred until after testing.** Ship one searchable
-  list. Split only if it turns out muddled in real use, not before.
-- **Remove and reset — planned, sequenced second.** Not cut. v1 gets add and
-  replace working end to end; remove and reset-to-default follow immediately
-  after, before anything else is considered.
+- **Apps stay first-class.** Ship one searchable list containing existing
+  actions and installed apps; an unbound app is a primary Add use case.
+- **Remove, not reset.** Remove is in the core product and leaves no shortcut.
+  Undo and reset-to-default are deferred.
+- **Primary action direct, secondary actions contextual.** Enter Adds or
+  Changes. A visible More menu opens with Right Arrow or mouse and contains
+  Remove; there is no global Delete shortcut.

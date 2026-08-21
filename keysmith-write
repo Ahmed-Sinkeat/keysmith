@@ -1,15 +1,28 @@
 #!/usr/bin/env bash
 # Apply one binding to the user's bindings.lua.
 #
-# Usage: keysmith-write <canonicalKey> <label> <actionText> [--replace]
+# Usage:
+#   keysmith-write <newCanonicalKey> <oldCanonicalKey|''> <label> <actionText> [--replace]
+#   keysmith-write remove <currentCanonicalKey> <label> <actionText>
+#
+# oldCanonicalKey is empty for an app or removed action that is not bound yet.
+# For an existing binding it is the key currently owning the selected action;
+# moving that action must unbind the old key, not merely add a second shortcut.
+# Remove updates the same action-owned block and emits unbinds without a bind;
+# it leaves the action unbound instead of restoring a packaged default.
 #
 # Exit codes:
 #   0  written and verified
-#   2  combo is taken and --replace was not given (nothing written)
+#   2  new combo is taken by another binding and --replace was not given
 #   3  new config error, change rolled back and runtime restored
 #   4  rollback did not restore the baseline - needs a human
+#   5  Hyprland state could not be read (nothing written)
+#   6  reload/verification failed, change rolled back and runtime restored
 #
-# Two rules drive the shape of this file:
+# Three rules drive the shape of this file:
+#
+#   A rebind is a MOVE. Emitting only the new bind leaves the old key working
+#   too, which is an extra shortcut, not a rebind.
 #
 #   A non-empty `hyprctl configerrors` does not mean WE broke something. The
 #   file may have been broken before Keysmith touched it, and rolling back a
@@ -24,83 +37,301 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 KEYS="$HERE/keysmith-keys"
 BINDINGS="${KEYSMITH_BINDINGS:-$HOME/.config/hypr/bindings.lua}"
+HYPRCTL="${KEYSMITH_HYPRCTL:-hyprctl}"
 
-key="${1:?canonical key}"
-label="${2:?label}"
-action="${3:?action text}"
+mode=set
+if [[ ${1:-} == remove ]]; then
+  mode=remove
+  key=""
+  old_key="${2:?current canonical key}"
+  label="${3:?label}"
+  action="${4:?action text}"
+else
+  key="${1:?new canonical key}"
+  old_key="${2-}"
+  label="${3:?label}"
+  action="${4:?action text}"
+fi
 replace=0
-[[ "${4:-}" == "--replace" ]] && replace=1
+[[ $mode == set && "${5:-}" == "--replace" ]] && replace=1
 
 phase=baseline
+reload_count=0
 
 # Test seams. They exist so the rollback paths can be exercised without
 # breaking a real config; in normal use none of these are set.
 configerrors() {
   case "$phase" in
-    baseline)  [[ -n ${KEYSMITH_FAKE_BASELINE+x} ]] && { printf '%s' "$KEYSMITH_FAKE_BASELINE"; return; } ;;
-    after)     [[ -n ${KEYSMITH_FAKE_AFTER+x}    ]] && { printf '%s' "$KEYSMITH_FAKE_AFTER"; return; } ;;
-    restored)  [[ -n ${KEYSMITH_FAKE_RESTORED+x} ]] && { printf '%s' "$KEYSMITH_FAKE_RESTORED"; return; }
-               [[ -n ${KEYSMITH_FAKE_BASELINE+x} ]] && { printf '%s' "$KEYSMITH_FAKE_BASELINE"; return; } ;;
+    baseline) [[ -n ${KEYSMITH_FAKE_BASELINE+x} ]] && { printf '%s' "$KEYSMITH_FAKE_BASELINE"; return; } ;;
+    after)    [[ -n ${KEYSMITH_FAKE_AFTER+x} ]] && { printf '%s' "$KEYSMITH_FAKE_AFTER"; return; } ;;
+    restored)
+      [[ -n ${KEYSMITH_FAKE_RESTORED+x} ]] && { printf '%s' "$KEYSMITH_FAKE_RESTORED"; return; }
+      [[ -n ${KEYSMITH_FAKE_BASELINE+x} ]] && { printf '%s' "$KEYSMITH_FAKE_BASELINE"; return; }
+      ;;
   esac
-  hyprctl configerrors 2>/dev/null | grep -v '^[[:space:]]*$'
+
+  local output
+  if ! output=$("$HYPRCTL" configerrors 2>/dev/null); then
+    return 1
+  fi
+  printf '%s\n' "$output" | awk 'NF'
 }
 
 reload() {
-  [[ -n ${KEYSMITH_RELOAD_LOG:-} ]] && echo reload >>"$KEYSMITH_RELOAD_LOG"
+  if [[ -n ${KEYSMITH_RELOAD_LOG:-} ]]; then
+    printf 'reload\n' >>"$KEYSMITH_RELOAD_LOG" || return 1
+  fi
+  reload_count=$((reload_count + 1))
+  if [[ ${KEYSMITH_FAKE_RELOAD_FAIL_AT:-0} == "$reload_count" ]]; then
+    return 1
+  fi
   [[ ${KEYSMITH_DRYRUN:-0} == 1 ]] && return 0
-  hyprctl reload >/dev/null 2>&1
+  "$HYPRCTL" reload >/dev/null 2>&1
 }
 
 is_taken() {
   if [[ -n ${KEYSMITH_TAKEN+x} ]]; then
-    [[ -n $KEYSMITH_TAKEN && $KEYSMITH_TAKEN == "$key" ]]
-    return
+    [[ -n $KEYSMITH_TAKEN && $KEYSMITH_TAKEN == "$key" ]] && return 0
+    return 1
   fi
-  "$HERE/keysmith-read" 2>/dev/null |
-    jq -e --arg k "$key" 'any(.[]; .key == $k)' >/dev/null 2>&1
+
+  local catalog status
+  if ! catalog=$("$HERE/keysmith-read" 2>/dev/null); then
+    return 2
+  fi
+  jq -e --arg k "$key" 'any(.[]; .key == $k)' <<<"$catalog" >/dev/null 2>&1
+  status=$?
+  [[ $status == 0 ]] && return 0
+  [[ $status == 1 ]] && return 1
+  return 2
 }
 
-if is_taken && (( ! replace )); then
-  echo "taken: $key" >&2
-  exit 2
+# A selected binding already owns old_key. Capturing the same key is therefore
+# not a conflict with "another" binding. Any other taken destination requires
+# an explicit replace decision.
+if [[ $mode == set ]]; then
+  is_taken
+  taken=$?
+  if (( taken == 2 )); then
+    echo "keysmith: unable to read current bindings - nothing written" >&2
+    exit 5
+  fi
+  if (( taken == 0 )) && [[ "$key" != "$old_key" ]] && (( ! replace )); then
+    echo "taken: $key" >&2
+    exit 2
+  fi
 fi
 
-mkdir -p "$(dirname "$BINDINGS")"
-touch "$BINDINGS"
+if ! baseline=$(configerrors); then
+  echo "keysmith: unable to read Hyprland config errors - nothing written" >&2
+  exit 5
+fi
 
-baseline="$(configerrors)"
-saved="$(cat "$BINDINGS")"
-id=$(printf '%s%s%s' "$key" "$label" "$RANDOM" | sha256sum | cut -c1-6)
+# Resolve all key spellings before creating or touching the target file.
+write_key=""
+if [[ $mode == set ]] && ! write_key=$("$KEYS" spell "$key"); then
+  echo "keysmith: unsupported destination key - nothing written" >&2
+  exit 5
+fi
+old_write_key=""
+if [[ -n "$old_key" ]] && ! old_write_key=$("$KEYS" spell "$old_key"); then
+  echo "keysmith: unsupported old key - nothing written" >&2
+  exit 5
+fi
 
-# Canonical is for comparing; what goes on disk must use the spelling
-# Hyprland actually matches (comma, mouse:272, ...).
-write_key="$("$KEYS" spell "$key")"
+mkdir -p "$(dirname "$BINDINGS")" || exit 5
+existed=0
+[[ -e "$BINDINGS" ]] && existed=1
+backup=$(mktemp) || exit 5
+candidate=$(mktemp) || { rm -f "$backup"; exit 5; }
+trap 'rm -f "$backup" "$candidate"' EXIT
+if (( existed )); then
+  cp --preserve=mode,timestamps -- "$BINDINGS" "$backup" || exit 5
+else
+  : >"$backup" || exit 5
+fi
 
-{
+# The action identity is stable across Add, Change, and Remove. A matching
+# owned block can therefore be replaced in place instead of stacking an
+# unbounded history of overrides. Label participates because two described
+# actions may deliberately run the same command.
+if ! identity=$(jq -cn --arg label "$label" --arg action "$action" '[$label, $action]'); then
+  exit 5
+fi
+id=$(printf '%s' "$identity" | sha256sum | cut -c1-12)
+[[ -n $id ]] || exit 5
+begin_marker="-- keysmith:begin $id"
+end_marker="-- keysmith:end $id"
+
+begin_count=$(grep -cFx -- "$begin_marker" "$backup")
+end_count=$(grep -cFx -- "$end_marker" "$backup")
+if (( begin_count != end_count || begin_count > 1 )); then
+  echo "keysmith: malformed owned block $id - nothing written" >&2
+  exit 5
+fi
+
+disabled_json='[]'
+prior_current=""
+if (( begin_count == 1 )); then
+  if ! encoded=$(awk -v begin="$begin_marker" -v end="$end_marker" '
+      $0 == begin { inside=1; next }
+      $0 == end { inside=0 }
+      inside && /^-- keysmith:data / {
+        sub(/^-- keysmith:data /, "")
+        print
+        found++
+      }
+      END { if (found != 1) exit 1 }
+    ' "$backup"); then
+    echo "keysmith: owned block $id has no valid state - nothing written" >&2
+    exit 5
+  fi
+  if ! state_json=$(printf '%s' "$encoded" | base64 --decode 2>/dev/null); then
+    echo "keysmith: owned block $id has invalid state - nothing written" >&2
+    exit 5
+  fi
+  if ! jq -e --arg label "$label" --arg action "$action" '
+      .v == 1
+      and .label == $label
+      and .action == $action
+      and (.currentKey | type) == "string"
+      and (.state == "bound" or .state == "removed")
+      and (.disabledKeys | type) == "array"
+      and all(.disabledKeys[]; type == "string" and length > 0)
+    ' <<<"$state_json" >/dev/null; then
+    echo "keysmith: owned block $id has invalid state - nothing written" >&2
+    exit 5
+  fi
+  disabled_json=$(jq -c '.disabledKeys' <<<"$state_json") || exit 5
+  prior_current=$(jq -r '.currentKey' <<<"$state_json") || exit 5
+fi
+
+add_disabled() {
+  local disabled_key="$1"
+  [[ -z $disabled_key ]] && return 0
+  disabled_json=$(jq -c --arg key "$disabled_key" '. + [$key] | unique' <<<"$disabled_json") || exit 5
+}
+
+# Retain every key this action-owned state disabled before. Removing an older
+# block must never let a packaged default or previously replaced destination
+# spring back unexpectedly.
+add_disabled "$prior_current"
+add_disabled "$old_key"
+if [[ $mode == set ]] && (( replace )); then
+  add_disabled "$key"
+fi
+
+current_key=""
+state=removed
+if [[ $mode == set ]]; then
+  current_key="$key"
+  state=bound
+fi
+
+if ! state_json=$(jq -cn \
+    --arg label "$label" --arg action "$action" --arg current "$current_key" \
+    --arg state "$state" --argjson disabled "$disabled_json" \
+    '{v: 1, label: $label, action: $action, currentKey: $current,
+      state: $state, disabledKeys: $disabled}'); then
+  exit 5
+fi
+state_encoded=$(printf '%s' "$state_json" | base64 -w0) || exit 5
+
+disabled_write_keys=()
+while IFS= read -r disabled_key; do
+  [[ -z $disabled_key ]] && continue
+  if ! disabled_write_key=$("$KEYS" spell "$disabled_key"); then
+    echo "keysmith: unsupported stored key - nothing written" >&2
+    exit 5
+  fi
+  disabled_write_keys+=("$disabled_write_key")
+done < <(jq -r '.[]' <<<"$disabled_json")
+
+# label is data inside a Lua string; do not let a quote or backslash turn it
+# into Lua syntax. action is deliberately opaque Lua and is emitted verbatim.
+safe_label=${label//\\/\\\\}
+safe_label=${safe_label//\"/\\\"}
+safe_label=${safe_label//$'\n'/\\n}
+safe_label=${safe_label//$'\r'/\\r}
+
+# Copy every user-owned byte around the matching block. Byte offsets avoid a
+# line-oriented rewrite that could normalize unrelated whitespace or a missing
+# final newline. The one separator newline Keysmith added is replaced too.
+if (( begin_count == 1 )); then
+  begin_offset=$(LC_ALL=C grep -aboF -- "$begin_marker" "$backup" | head -1 | cut -d: -f1)
+  end_offset=$(LC_ALL=C grep -aboF -- "$end_marker" "$backup" | head -1 | cut -d: -f1)
+  file_size=$(stat -c %s "$backup") || exit 5
+  remove_start=$begin_offset
+  (( remove_start > 0 )) && remove_start=$((remove_start - 1))
+  remove_end=$((end_offset + ${#end_marker}))
+  (( remove_end < file_size )) && remove_end=$((remove_end + 1))
+  : >"$candidate" || exit 5
+  if (( remove_start > 0 )); then
+    dd if="$backup" of="$candidate" bs=1 count="$remove_start" status=none || exit 5
+  fi
+  if (( remove_end < file_size )); then
+    dd if="$backup" of="$candidate" bs=1 skip="$remove_end" seek="$remove_start" conv=notrunc status=none || exit 5
+  fi
+else
+  cp -- "$backup" "$candidate" || exit 5
+fi
+
+restore_file() {
+  if (( existed )); then
+    cp --preserve=mode,timestamps -- "$backup" "$BINDINGS"
+  else
+    rm -f -- "$BINDINGS"
+  fi
+}
+
+rollback() {
+  local exit_code="$1" message="$2" restored
+  if ! restore_file || ! reload; then
+    echo "ROLLBACK INCOMPLETE - inspect $BINDINGS by hand" >&2
+    exit 4
+  fi
+  phase=restored
+  if ! restored=$(configerrors); then
+    echo "ROLLBACK INCOMPLETE - could not verify $BINDINGS" >&2
+    exit 4
+  fi
+  if [[ "$restored" == "$baseline" ]]; then
+    echo "$message: $BINDINGS" >&2
+    exit "$exit_code"
+  fi
+  echo "ROLLBACK INCOMPLETE - inspect $BINDINGS by hand" >&2
+  exit 4
+}
+
+if ! {
   printf '\n-- keysmith:begin %s\n' "$id"
-  (( replace )) && printf 'hl.unbind("%s")\n' "$write_key"
-  printf 'o.bind("%s", "%s", %s)\n' "$write_key" "$label" "$action"
+  printf '%s\n' "-- keysmith:data $state_encoded"
+  for disabled_write_key in "${disabled_write_keys[@]}"; do
+    printf 'hl.unbind("%s")\n' "$disabled_write_key"
+  done
+  if [[ $mode == set ]]; then
+    printf 'o.bind("%s", "%s", %s)\n' "$write_key" "$safe_label" "$action"
+  fi
   printf -- '-- keysmith:end %s\n' "$id"
-} >>"$BINDINGS"
+} >>"$candidate"; then
+  rollback 6 "write failed, restored"
+fi
 
-reload
+if ! cp -- "$candidate" "$BINDINGS"; then
+  rollback 6 "write failed, restored"
+fi
+
+if ! reload; then
+  rollback 6 "reload failed, restored"
+fi
 phase=after
-after="$(configerrors)"
+if ! after=$(configerrors); then
+  rollback 6 "verification failed, restored"
+fi
 
 if [[ "$after" == "$baseline" ]]; then
   echo "$id"
   exit 0
 fi
 
-printf '%s' "$saved" >"$BINDINGS"
-reload
-phase=restored
-restored="$(configerrors)"
-
-if [[ "$restored" == "$baseline" ]]; then
-  echo "rolled back: $BINDINGS" >&2
-  exit 3
-fi
-
-echo "ROLLBACK INCOMPLETE - inspect $BINDINGS by hand" >&2
-exit 4
+rollback 3 "rolled back"

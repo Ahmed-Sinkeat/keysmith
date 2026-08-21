@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Reader regressions: duplicate live keys must retain the action belonging to
+# their description, and a failed Hyprland scan must never look like an empty
+# conflict map.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+R="$ROOT/keysmith-read"
+fail=0
+say() { if [[ $1 == 0 ]]; then echo "ok   $2"; else echo "FAIL $2"; fail=1; fi; }
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/omarchy/default/hypr/bindings" "$tmp/home/.local/share/applications"
+
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  '[[ ${KEYSMITH_FAIL_BINDS:-0} == 1 ]] && exit 7' \
+  '[[ ${1:-} == binds ]] || exit 9' \
+  "printf 'bind\\n\\tmodmask: 8\\n\\tkey: TAB\\n\\tdescription: Focus on next window\\n'" \
+  "printf 'bind\\n\\tmodmask: 8\\n\\tkey: TAB\\n\\tdescription: Reveal active window on top\\n'" \
+  "printf 'bind\\n\\tmodmask: 0\\n\\tkey: F9\\n\\tdescription: Start dictation (push-to-talk)\\n'" \
+  "printf 'bind\\n\\tmodmask: 0\\n\\tkey: F9\\n\\tdescription: Stop dictation (push-to-talk)\\n'" \
+  "printf 'bind\\n\\tmodmask: 64\\n\\tkey: X\\n\\tdescription: Live override\\n'" \
+  >"$tmp/hyprctl"
+chmod +x "$tmp/hyprctl"
+
+printf '%s\n' \
+  'o.bind("ALT + TAB", "Focus on next window", hl.dsp.window.cycle_next())' \
+  'o.bind("ALT + TAB", "Reveal active window on top", hl.dsp.window.bring_to_top())' \
+  'o.bind("F9", "Start dictation (push-to-talk)", "voxtype record start")' \
+  'o.bind("F9", "Stop dictation (push-to-talk)", "voxtype record stop", { release = true })' \
+  'o.bind("SUPER + X", "Old overridden", "old-command")' \
+  'o.bind("SUPER + X", "Live override", "new-command")' \
+  'o.bind("SUPER + R", "Removed action", "removed-command")' \
+  >"$tmp/omarchy/default/hypr/bindings/test.lua"
+: >"$tmp/bindings.lua"
+printf '%s\n' \
+  '[Desktop Entry]' \
+  'Type=Application' \
+  'Name=Removed action' \
+  'Exec=removed-command' \
+  >"$tmp/home/.local/share/applications/removed.desktop"
+
+catalog=$(HOME="$tmp/home" OMARCHY_PATH="$tmp/omarchy" \
+  KEYSMITH_BINDINGS="$tmp/bindings.lua" KEYSMITH_HYPRCTL="$tmp/hyprctl" \
+  "$R")
+say $? "reader succeeds with duplicate live keys"
+
+action=$(jq -r '.[] | select(.source == "binding" and .label == "Focus on next window") | .action' <<<"$catalog")
+[[ $action == 'hl.dsp.window.cycle_next()' ]]; say $? "first ALT+TAB action matches its description"
+action=$(jq -r '.[] | select(.source == "binding" and .label == "Reveal active window on top") | .action' <<<"$catalog")
+[[ $action == 'hl.dsp.window.bring_to_top()' ]]; say $? "second ALT+TAB action matches its description"
+action=$(jq -r '.[] | select(.source == "binding" and .label == "Start dictation (push-to-talk)") | .action' <<<"$catalog")
+[[ $action == '"voxtype record start"' ]]; say $? "F9 press action remains start"
+action=$(jq -r '.[] | select(.source == "binding" and .label == "Stop dictation (push-to-talk)") | .action' <<<"$catalog")
+[[ $action == '"voxtype record stop", { release = true }' ]]; say $? "F9 release action remains stop"
+jq -e 'all(.[] | select(.key == "ALT + TAB" or .key == "F9"); .rebindable == false)' <<<"$catalog" >/dev/null
+say $? "multi-action keys cannot lose a sibling through key-only unbind"
+jq -e 'any(.[]; .label == "Removed action" and .key == null and .source == "action" and .action == "\"removed-command\"" and .rebindable)' <<<"$catalog" >/dev/null
+say $? "parseable removed action remains available to add again"
+jq -e '[.[] | select(.label == "Removed action")] | length == 1' <<<"$catalog" >/dev/null
+say $? "installed app is deduplicated against an unbound action"
+jq -e '[.[] | select(.label == "Focus on next window")] | length == 1' <<<"$catalog" >/dev/null
+say $? "live action is not duplicated as an unbound action"
+jq -e 'any(.[]; .label == "Live override" and .action == "\"new-command\"" and .rebindable)' <<<"$catalog" >/dev/null
+say $? "one live action stays rebindable despite an overridden source sibling"
+
+KEYSMITH_FAIL_BINDS=1 HOME="$tmp/home" OMARCHY_PATH="$tmp/omarchy" \
+  KEYSMITH_BINDINGS="$tmp/bindings.lua" KEYSMITH_HYPRCTL="$tmp/hyprctl" \
+  "$R" >/dev/null 2>&1
+[[ $? -ne 0 ]]; say $? "failed Hyprland scan fails closed"
+
+[[ $fail == 0 ]] && echo "PASS" || echo "FAILED"
+exit $fail
