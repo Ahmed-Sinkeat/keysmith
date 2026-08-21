@@ -6,6 +6,16 @@
   "author": "Ahmed-Sinkeat",
   "license": "MIT",
   "description": "Add, change, and remove Omarchy shortcuts without editing config files",
-  "kinds": ["overlay"],
-  "entryPoints": { "overlay": "Keysmith.qml" }
+  "kinds": ["overlay", "bar-widget"],
+  "entryPoints": {
+    "overlay": "Keysmith.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Keysmith",
+    "description": "Open the shortcut manager",
+    "category": "Compositor",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
 }

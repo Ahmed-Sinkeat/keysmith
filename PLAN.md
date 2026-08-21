@@ -1104,3 +1104,13 @@ Agreed interaction contract:
   with a reversible binding, then restore the original config exactly.
 - [x] Confirm the More menu and Escape state transitions by keyboard, and
   verify visible mouse hit targets for rows and controls.
+
+### Task 12: Discoverable launch and honest loading
+
+- [x] Expose Keysmith as an optional Omarchy bar widget so enabled installs do
+  not depend on a remembered terminal command.
+- [x] Show an explicit loading state instead of briefly presenting the editor
+  escape hatch as the complete catalog.
+- [x] Label non-rebindable rows as view-only and explain why they are protected.
+- [x] Validate both QML entry points and exercise the bar button in the live
+  shell.

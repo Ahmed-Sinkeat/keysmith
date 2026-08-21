@@ -17,12 +17,24 @@ omarchy plugin add https://github.com/Ahmed-Sinkeat/keysmith.git --enable
 Then restart the shell:
 
 ```
-omarchy-restart-shell
+omarchy restart shell
+```
+
+The enabled plugin adds a keyboard button to the Omarchy bar. Click it to open
+Keysmith; the terminal command below is only a fallback.
+
+When updating an older overlay-only Keysmith install, move it into the bar
+once:
+
+```
+omarchy plugin disable sinkeat.keysmith
+omarchy plugin enable sinkeat.keysmith --section right
 ```
 
 ## Usage
 
-Open the overlay:
+Open the overlay from its keyboard button in the Omarchy bar. If the button is
+not on the bar yet, add it from `Setup → Plugins → Enable Plugin`, or use:
 
 ```
 omarchy-shell shell toggle sinkeat.keysmith
@@ -37,6 +49,8 @@ o.bind("SUPER + CTRL + J", "Keysmith", "omarchy-shell shell toggle sinkeat.keysm
 In the overlay:
 
 - Type to search, `Up`/`Down` to move.
+- Dimmed rows marked `view only` are generated or shared shortcuts that
+  Keysmith cannot safely rewrite. They still count when checking conflicts.
 - `Enter` adds or changes the selected row, then records the combo you want.
   Hyprland's own shortcuts
   are suppressed while recording, so a combo that is already in use still

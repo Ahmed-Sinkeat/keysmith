@@ -49,6 +49,12 @@ part of it and has deliberately different semantics: no shortcut remains.
 
 ## Insertion point
 
+The installed plugin exposes a small keyboard button as an Omarchy bar widget.
+`omarchy plugin add … --enable` places it during installation, so opening
+Keysmith never depends on remembering a terminal command.
+
+The closer first-party integration remains replacing the existing menu action:
+
 Override the existing menu id in `~/.config/omarchy/extensions/omarchy-menu.jsonc`:
 
 ```jsonc
@@ -61,7 +67,9 @@ and three built-in entries already summon overlays this way
 
 Deleting that one line restores the editor. Nothing is patched or forked.
 
-Optionally also bind a key directly in `bindings.lua`.
+The third-party plugin does not edit this user-owned menu file automatically.
+Users can choose the override or bind a key directly in `bindings.lua`, but
+neither is required while the bar button is enabled.
 
 ## Architecture
 

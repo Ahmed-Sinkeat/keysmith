@@ -24,6 +24,7 @@ Item {
   property var rows: []
   property string filterText: ""
   property var selected: null
+  property bool loading: false
 
   property bool capturing: false
   property bool capturePending: false
@@ -105,7 +106,7 @@ Item {
     // Design calls these rows visible for conflicts but not rebindable. Say so
     // instead of capturing a key we would only fail to write.
     if (!row.rebindable) {
-      root.status = "can't rebind here — edit bindings.lua manually · Escape to go back"
+      root.status = "view only — this shortcut is generated or shared, so Keysmith can't change it safely. It still counts as a conflict · Escape to go back"
       return
     }
 
@@ -254,6 +255,7 @@ Item {
       id: readOutput
     }
     onExited: function (exitCode) {
+      root.loading = false
       if (exitCode !== 0) {
         root.rows = []
         root.loadError = "can't read Hyprland bindings — close and try again"
@@ -291,6 +293,8 @@ Item {
   })
 
   readonly property var filtered: {
+    if (root.loading)
+      return []
     var q = root.filterText.toLowerCase()
     var out = q ? root.rows.filter(function (r) {
       return r.label.toLowerCase().indexOf(q) !== -1
@@ -320,6 +324,7 @@ Item {
     root.pendingSummary = ""
     root.successText = ""
     root.rows = []
+    root.loading = true
     readProc.running = true
     root.opened = true
     Qt.callLater(function () {
@@ -425,6 +430,29 @@ Item {
           color: root.foreground
           opacity: 0.75
           font.family: root.fontFamily
+        }
+
+        Column {
+          visible: root.loading
+          width: parent.width
+          spacing: Style.space(8)
+
+          Text {
+            width: parent.width
+            text: "Loading shortcuts…"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+          }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Reading your Omarchy shortcuts and installed apps."
+            color: root.foreground
+            opacity: 0.6
+            font.family: root.fontFamily
+          }
         }
 
         Column {
@@ -723,7 +751,7 @@ Item {
 
         ListView {
           id: list
-          visible: !root.capturing && root.capturedKey.length === 0
+          visible: !root.loading && !root.capturing && root.capturedKey.length === 0
                    && !root.blockedSelection && root.loadError.length === 0
                    && !root.actionMenuOpen && !root.removeConfirm
                    && root.successText.length === 0
@@ -742,10 +770,13 @@ Item {
               : "transparent"
 
             Text {
+              id: rowLabel
               anchors.left: parent.left
               anchors.leftMargin: Style.space(6)
+              anchors.right: shortcutText.visible ? shortcutText.left
+                : (rowState.visible ? rowState.left : parent.right)
+              anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
-              width: parent.width * 0.6
               elide: Text.ElideRight
               text: modelData.label
               color: root.foreground
@@ -754,11 +785,26 @@ Item {
             }
 
             Text {
+              id: shortcutText
+              visible: text.length > 0
+              anchors.right: rowState.visible ? rowState.left : parent.right
+              anchors.rightMargin: rowState.visible ? Style.space(8) : Style.space(6)
+              anchors.verticalCenter: parent.verticalCenter
+              text: modelData.key || ""
+              color: root.foreground
+              opacity: 0.55
+              font.family: root.fontFamily
+            }
+
+            Text {
+              id: rowState
+              visible: text.length > 0
               anchors.right: parent.right
               anchors.rightMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
-              text: modelData.key ? modelData.key
-                : (modelData.source === "app" || modelData.source === "action" ? "not bound" : "")
+              text: modelData.key && !modelData.rebindable ? "· view only"
+                : (!modelData.key && (modelData.source === "app" || modelData.source === "action")
+                   ? "not bound" : "")
               color: root.foreground
               opacity: 0.55
               font.family: root.fontFamily
@@ -798,7 +844,7 @@ Item {
                 if (row.editor)
                   return "Open editor · Enter"
                 if (!row.rebindable)
-                  return "Details · Enter"
+                  return "Why view only? · Enter"
                 return (row.key ? "Change shortcut" : "Add shortcut") + " · Enter"
               }
               color: root.foreground
@@ -841,6 +887,13 @@ Item {
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function (event) {
           if (root.operationPending) {
+            event.accepted = true
+            return
+          }
+
+          if (root.loading) {
+            if (event.key === Qt.Key_Escape)
+              root.dismiss()
             event.accepted = true
             return
           }
