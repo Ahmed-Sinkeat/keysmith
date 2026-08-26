@@ -60,7 +60,8 @@ In the overlay:
 - `Right Arrow` opens the visible More menu. Remove shortcut lives there and
   asks for confirmation; removing leaves the item unbound rather than resetting
   it to an Omarchy default.
-- `Escape` backs out one step at a time, and always works.
+- `Escape` backs out one step at a time, and always works. Recording also closes
+  automatically after 20 seconds.
 
 Shortcuts Keysmith cannot parse — loop-generated ones like the workspace keys —
 are listed so they still count as conflicts, but cannot be rebound here. The

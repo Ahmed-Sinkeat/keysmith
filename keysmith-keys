@@ -30,8 +30,8 @@ canon_key() {
     # Hyprland's code:N is evdev+8. The number row is the only place Omarchy
     # uses it in bulk (every workspace binding), and a captured digit must
     # compare equal to it or SUPER+1 looks free when it is not.
-    # ponytail: number row only; other code:N stays literal, which still
-    # detects code-vs-code conflicts. Widen via xkbcli if that ever matters.
+    # Only the number row is decoded. Other code:N values stay literal, which
+    # still detects code-vs-code conflicts without guessing a keyboard layout.
     code:1[0-9])
       local n="${k#[Cc][Oo][Dd][Ee]:}"
       printf '%s' "$(( n == 19 ? 0 : n - 9 ))"; return ;;
@@ -64,11 +64,15 @@ case "${1:-}" in
     case "$k" in
       32)       key=space ;;
       44)       key=comma ;;
+      39)       key=apostrophe ;;
       46)       key=period ;;
       47)       key=slash ;;
       45)       key=minus ;;
       61)       key=equal ;;
       59)       key=semicolon ;;
+      91)       key=bracketleft ;;
+      92)       key=backslash ;;
+      93)       key=bracketright ;;
       96)       key=grave ;;
       16777216) key=escape ;;
       16777217|16777218) key=tab ;;      # Tab / Backtab

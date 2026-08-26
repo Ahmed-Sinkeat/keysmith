@@ -29,6 +29,14 @@ check "SUPER + SHIFT + W"  lua "super+shift+w"
 check "SUPER + COMMA"      hypr 64 comma
 check "SUPER + COMMA"      lua "SUPER + comma"
 check "SUPER + COMMA"      qt 44 268435456
+check "SUPER + APOSTROPHE" qt 39 268435456
+check "SUPER + APOSTROPHE" hypr 64 apostrophe
+check "SUPER + BRACKETLEFT" qt 91 268435456
+check "SUPER + BRACKETLEFT" hypr 64 bracketleft
+check "SUPER + BACKSLASH" qt 92 268435456
+check "SUPER + BACKSLASH" hypr 64 backslash
+check "SUPER + BRACKETRIGHT" qt 93 268435456
+check "SUPER + BRACKETRIGHT" hypr 64 bracketright
 check "SUPER + DELETE"     hypr 64 Delete
 check "SUPER + DELETE"     hypr 64 DELETE
 check "SUPER + DELETE"     lua "SUPER + Delete"
@@ -44,6 +52,10 @@ check "SUPER + SHIFT + code:201" lua "SUPER + SHIFT + code:201"
 
 # spell: canonical -> what is safe to WRITE into bindings.lua
 check "SUPER + comma"          spell "SUPER + COMMA"
+check "SUPER + apostrophe"     spell "SUPER + APOSTROPHE"
+check "SUPER + bracketleft"    spell "SUPER + BRACKETLEFT"
+check "SUPER + backslash"      spell "SUPER + BACKSLASH"
+check "SUPER + bracketright"   spell "SUPER + BRACKETRIGHT"
 check "SUPER + SHIFT + W"      spell "SUPER + SHIFT + W"
 check "SUPER + SPACE"          spell "SUPER + SPACE"
 check "SUPER + mouse:272"      spell "SUPER + mouse:272"

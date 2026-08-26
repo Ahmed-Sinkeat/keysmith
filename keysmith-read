@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Emit the Keysmith catalog as a JSON array on stdout. Read-only.
 #
-# Three sources, three tiers (see DESIGN.md):
+# Three sources, three tiers:
 #   hyprctl binds  -> authoritative map of what combos are TAKEN
 #   packaged Lua   -> verbatim action text, the only place it exists
 #   .desktop files -> apps that have no binding yet
@@ -81,25 +81,46 @@ apps_tsv() {
   done | sort -u -t$'\t' -k1,1
 }
 
-b=$(binds_tsv) || exit 1
-a=$(lua_tsv) || { echo "keysmith: unable to read binding actions" >&2; exit 1; }
-p=$(apps_tsv)
+live_bindings=$(binds_tsv) || exit 1
+action_definitions=$(lua_tsv) || { echo "keysmith: unable to read binding actions" >&2; exit 1; }
+desktop_apps=$(apps_tsv)
 
-jq -n --arg binds "$b" --arg acts "$a" --arg apps "$p" '
-  def rows($s): $s | split("\n") | map(select(length > 0) | split("\t"));
+jq -n --arg binds "$live_bindings" --arg actions "$action_definitions" --arg apps "$desktop_apps" '
+  def tsv_rows($text):
+    $text | split("\n") | map(select(length > 0) | split("\t"));
 
-  (rows($acts)) as $A
+  def action_words($action):
+    [($action // "" | ascii_downcase) | splits("[^A-Za-z0-9_.+-]+")];
+
+  # Prefer an exact display-name match. It identifies wrappers and webapps
+  # whose shared launcher executable cannot distinguish one desktop entry from
+  # another. Fall back to the executable basename for differently named rows.
+  def matching_apps($row; $apps):
+    ($apps | map(select(
+      (.label | ascii_downcase) == ($row.label | ascii_downcase)
+    ))) as $nameMatches
+    | if ($nameMatches | length) > 0 then $nameMatches
+      else ($apps | map(
+        . as $app
+        | select(
+            $app.base != ""
+            and (action_words($row.action) | index($app.base)) != null
+          )
+      ))
+      end;
+
+  (tsv_rows($actions)) as $actionDefinitions
 
   # A key may legitimately own more than one action: ALT+TAB has two press
   # actions and F9 has distinct press/release actions. Match the description
   # so the catalog still reports the correct action. Such rows are deliberately
   # non-rebindable, though: hl.unbind accepts only a key and would remove every
   # sibling action while Keysmith moved just the selected one.
-  | (rows($binds)) as $L
-  | ($L | map(
+  | (tsv_rows($binds)) as $liveBindings
+  | ($liveBindings | map(
       . as $bind
-      | ($L | map(select(.[0] == $bind[0]))) as $liveByKey
-      | ($A | map(select(.[0] == $bind[0]))) as $byKey
+      | ($liveBindings | map(select(.[0] == $bind[0]))) as $liveByKey
+      | ($actionDefinitions | map(select(.[0] == $bind[0]))) as $byKey
       | ($byKey | map(select(.[1] == ($bind[1] // "")))) as $byDescription
       | (if ($byDescription | length) == 1 then $byDescription[0][2]
          elif ($byKey | length) == 1 then $byKey[0][2]
@@ -112,18 +133,18 @@ jq -n --arg binds "$b" --arg acts "$a" --arg apps "$p" '
           action:     $action,
           rebindable: ($action != null and ($liveByKey | length) == 1)
         }
-    )) as $B
+    )) as $bindingRows
 
   # Definitions still present in Lua but absent from the live binding map are
   # actions with no shortcut. This is how a removed default remains searchable
   # and can be Added again later. Identity is label+opaque action, matching the
   # the stable owned-block identity used by the writer.
-  | ($A
+  | ($actionDefinitions
     | unique_by([.[1], .[2]])
     | map(
         . as $definition
         | select(
-            ($B | any(
+            ($bindingRows | any(
               .label == (if ($definition[1] // "") == "" then $definition[0] else $definition[1] end)
               and .action == $definition[2]
             )) | not
@@ -135,17 +156,10 @@ jq -n --arg binds "$b" --arg acts "$a" --arg apps "$p" '
             action:     .[2],
             rebindable: true
           }
-      )) as $U
+      )) as $unboundActions
 
-  # Executable basenames already spoken for by some binding. Split into words
-  # rather than substring-matching: a short basename like "code" occurs inside
-  # plenty of unrelated action text, and hiding an installed app because of a
-  # coincidental substring is a silent wrong answer.
-  | (($B + $U) | map(.action // "")
-        | join(" ")
-        | [splits("[^A-Za-z0-9_.+-]+")]) as $boundwords
-
-  | (rows($apps) | map({
+  | (tsv_rows($apps) | map({
+      _appId:     ([.[0], .[1]] | @json),
       label:      .[0],
       key:        null,
       source:     "app",
@@ -154,10 +168,30 @@ jq -n --arg binds "$b" --arg acts "$a" --arg apps "$p" '
       # containing " or \ emit Lua that does not parse.
       action:     ("{ launch = " + (.[1] | @json) + " }"),
       rebindable: true,
-      base:       (.[1] | split(" ")[0] | split("/") | last)
-    })
-    | map(. as $r | select($r.base != "" and (($boundwords | index($r.base)) == null)))
-    | map(del(.base))) as $P
+      base:       (.[1] | split(" ")[0] | split("/") | last | ascii_downcase)
+    })) as $desktopApps
 
-  | $B + $U + $P
+  # Merge a desktop app into its live or removed action row. `identityLabel`
+  # preserves the original Lua description for the stable writer block id;
+  # `label` becomes the app name users expect to search for and see.
+  | (($bindingRows + $unboundActions) | map(
+      . as $row
+      | matching_apps($row; $desktopApps) as $matches
+      | if ($matches | length) == 1 then
+          . + {
+            identityLabel: .label,
+            label: $matches[0].label,
+            _matchedAppId: $matches[0]._appId
+          }
+        else .
+        end
+    )) as $catalogRows
+
+  | ($desktopApps | map(
+      . as $app
+      | select(($catalogRows | any(._matchedAppId? == $app._appId)) | not)
+      | del(.base, ._appId)
+    )) as $unboundApps
+
+  | ($catalogRows | map(del(._matchedAppId))) + $unboundApps
 '

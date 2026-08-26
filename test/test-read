@@ -22,6 +22,8 @@ printf '%s\n' \
   "printf 'bind\\n\\tmodmask: 0\\n\\tkey: F9\\n\\tdescription: Start dictation (push-to-talk)\\n'" \
   "printf 'bind\\n\\tmodmask: 0\\n\\tkey: F9\\n\\tdescription: Stop dictation (push-to-talk)\\n'" \
   "printf 'bind\\n\\tmodmask: 64\\n\\tkey: X\\n\\tdescription: Live override\\n'" \
+  "printf 'bind\\n\\tmodmask: 64\\n\\tkey: C\\n\\tdescription: Code editor\\n'" \
+  "printf 'bind\\n\\tmodmask: 65\\n\\tkey: A\\n\\tdescription: AI assistant\\n'" \
   >"$tmp/hyprctl"
 chmod +x "$tmp/hyprctl"
 
@@ -33,6 +35,8 @@ printf '%s\n' \
   'o.bind("SUPER + X", "Old overridden", "old-command")' \
   'o.bind("SUPER + X", "Live override", "new-command")' \
   'o.bind("SUPER + R", "Removed action", "removed-command")' \
+  'o.bind("SUPER + C", "Code editor", { launch = "acme-editor --new-window" })' \
+  'o.bind("SUPER + SHIFT + A", "AI assistant", { webapp = "https://assistant.invalid" })' \
   >"$tmp/omarchy/default/hypr/bindings/test.lua"
 : >"$tmp/bindings.lua"
 printf '%s\n' \
@@ -41,6 +45,18 @@ printf '%s\n' \
   'Name=Removed action' \
   'Exec=removed-command' \
   >"$tmp/home/.local/share/applications/removed.desktop"
+printf '%s\n' \
+  '[Desktop Entry]' \
+  'Type=Application' \
+  'Name=Acme Editor' \
+  'Exec=acme-editor %F' \
+  >"$tmp/home/.local/share/applications/acme-editor.desktop"
+printf '%s\n' \
+  '[Desktop Entry]' \
+  'Type=Application' \
+  'Name=AI assistant' \
+  'Exec=omarchy-launch-webapp https://assistant.invalid' \
+  >"$tmp/home/.local/share/applications/assistant.desktop"
 
 catalog=$(HOME="$tmp/home" OMARCHY_PATH="$tmp/omarchy" \
   KEYSMITH_BINDINGS="$tmp/bindings.lua" KEYSMITH_HYPRCTL="$tmp/hyprctl" \
@@ -65,6 +81,14 @@ jq -e '[.[] | select(.label == "Focus on next window")] | length == 1' <<<"$cata
 say $? "live action is not duplicated as an unbound action"
 jq -e 'any(.[]; .label == "Live override" and .action == "\"new-command\"" and .rebindable)' <<<"$catalog" >/dev/null
 say $? "one live action stays rebindable despite an overridden source sibling"
+jq -e 'any(.[]; .label == "Acme Editor" and .identityLabel == "Code editor" and .key == "SUPER + C" and .source == "binding")' <<<"$catalog" >/dev/null
+say $? "desktop app merges with its differently named live binding"
+jq -e '[.[] | select(.label == "Acme Editor")] | length == 1' <<<"$catalog" >/dev/null
+say $? "merged executable app is not duplicated as unbound"
+jq -e 'any(.[]; .label == "AI assistant" and .identityLabel == "AI assistant" and .key == "SUPER + SHIFT + A")' <<<"$catalog" >/dev/null
+say $? "matching label merges a webapp whose launcher basename is shared"
+jq -e '[.[] | select(.label == "AI assistant")] | length == 1' <<<"$catalog" >/dev/null
+say $? "label-matched webapp is not duplicated as unbound"
 
 KEYSMITH_FAIL_BINDS=1 HOME="$tmp/home" OMARCHY_PATH="$tmp/omarchy" \
   KEYSMITH_BINDINGS="$tmp/bindings.lua" KEYSMITH_HYPRCTL="$tmp/hyprctl" \

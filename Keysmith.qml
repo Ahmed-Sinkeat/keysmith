@@ -24,21 +24,22 @@ Item {
   property var rows: []
   property string filterText: ""
   property var selected: null
-  property bool loading: false
-
-  property bool capturing: false
+  property string viewState: "browsing"
   property bool capturePending: false
   property string capturedKey: ""
   property string status: ""
   property string loadError: ""
-  property bool actionMenuOpen: false
   property int actionMenuIndex: 0
-  property bool removeConfirm: false
-  property bool operationPending: false
-  property string writeOperation: ""
+  property string pendingReturnState: "browsing"
+  property string pendingOperation: ""
   property string pendingSummary: ""
   property string successText: ""
-  readonly property bool blockedSelection: root.selected && !root.selected.rebindable && root.status.length > 0
+  readonly property bool loading: root.viewState === "loading"
+  readonly property bool capturing: root.viewState === "capturing"
+  readonly property bool actionMenuOpen: root.viewState === "action-menu"
+  readonly property bool removeConfirm: root.viewState === "remove-confirm"
+  readonly property bool operationPending: root.viewState === "saving"
+  readonly property bool blockedSelection: root.viewState === "blocked"
   readonly property var highlightedRow: {
     var i = list.currentIndex
     return i >= 0 && i < root.filtered.length ? root.filtered[i] : null
@@ -68,8 +69,9 @@ Item {
       var key = keysOutput.text.trim()
       if (exitCode === 0 && key.length > 0) {
         root.capturedKey = key
-        root.capturing = false
+        root.viewState = "captured"
         root.status = ""
+        captureTimer.stop()
         return
       }
       // Stay in capture mode so an unsupported key never looks like a cancel.
@@ -92,8 +94,6 @@ Item {
     if (!row)
       return
     root.selected = row
-    root.actionMenuOpen = false
-    root.removeConfirm = false
     root.capturedKey = ""
     root.status = ""
 
@@ -107,10 +107,12 @@ Item {
     // instead of capturing a key we would only fail to write.
     if (!row.rebindable) {
       root.status = "view only — this shortcut is generated or shared, so Keysmith can't change it safely. It still counts as a conflict · Escape to go back"
+      root.viewState = "blocked"
       return
     }
 
-    root.capturing = true
+    root.viewState = "capturing"
+    captureTimer.restart()
   }
 
   function beginCapture() {
@@ -123,14 +125,14 @@ Item {
     root.selected = root.highlightedRow
     root.actionMenuIndex = 0
     root.status = ""
-    root.actionMenuOpen = true
+    root.viewState = "action-menu"
   }
 
   function closeActionMenu() {
-    root.actionMenuOpen = false
     root.actionMenuIndex = 0
     root.selected = null
     root.status = ""
+    root.viewState = "browsing"
   }
 
   function runActionMenu(index) {
@@ -142,9 +144,8 @@ Item {
       return
     }
     if (actionId === "remove") {
-      root.actionMenuOpen = false
-      root.removeConfirm = true
       root.status = ""
+      root.viewState = "remove-confirm"
       return
     }
     editorProc.running = true
@@ -154,39 +155,79 @@ Item {
   function retryCapture() {
     root.capturedKey = ""
     root.status = ""
-    root.capturing = true
+    root.viewState = "capturing"
+    captureTimer.restart()
   }
 
   function cancelCapture() {
     root.capturePending = false
     if (keysProc.running)
       keysProc.running = false
-    root.capturing = false
+    captureTimer.stop()
     root.capturedKey = ""
     root.selected = null
-    root.actionMenuOpen = false
-    root.removeConfirm = false
     root.status = ""
+    root.viewState = "browsing"
+  }
+
+  function handleEscape() {
+    // This is the single Escape path and it runs before every state-specific
+    // key handler. Even a pending writer may be hidden safely while it finishes.
+    if (root.operationPending || root.loading || root.viewState === "load-error") {
+      root.dismiss()
+      return
+    }
+    if (root.viewState === "success") {
+      successTimer.stop()
+      root.successText = ""
+      root.dismiss()
+      return
+    }
+    if (root.removeConfirm) {
+      root.status = ""
+      root.viewState = "action-menu"
+      return
+    }
+    if (root.actionMenuOpen) {
+      root.closeActionMenu()
+      return
+    }
+    if (root.capturing || root.viewState === "captured" || root.blockedSelection) {
+      root.cancelCapture()
+      return
+    }
+    if (root.filterText)
+      root.filterText = ""
+    else
+      root.dismiss()
+  }
+
+  Timer {
+    id: captureTimer
+    interval: 20000
+    repeat: false
+    onTriggered: {
+      root.cancelCapture()
+      root.dismiss()
+    }
   }
 
   Process {
     id: writeProc
     onExited: function (exitCode) {
-      root.operationPending = false
       if (exitCode === 0) {
-        root.capturing = false
         root.capturePending = false
         root.capturedKey = ""
-        root.actionMenuOpen = false
-        root.removeConfirm = false
         root.status = ""
         root.successText = root.pendingSummary
         root.pendingSummary = ""
+        root.viewState = "success"
         successTimer.restart()
         return
       }
       root.pendingSummary = ""
       root.successText = ""
+      root.viewState = root.pendingReturnState
       root.status = exitCode === 2 ? "already taken - nothing written"
         : exitCode === 3 ? "config error - change rolled back"
         : exitCode === 4 ? "rollback failed - check bindings.lua"
@@ -207,16 +248,17 @@ Item {
       return
     }
 
-    root.writeOperation = root.selected.key ? "change" : "add"
+    root.pendingOperation = root.selected.key ? "change" : "add"
+    root.pendingReturnState = "captured"
     root.pendingSummary = root.selected.key
       ? "Changed “" + root.selected.label + "” from " + root.selected.key + " to " + root.capturedKey
       : "Added " + root.capturedKey + " to “" + root.selected.label + "”"
     root.status = "saving..."
-    root.operationPending = true
+    root.viewState = "saving"
     // The old key rides along: without it the writer can only add a second
     // shortcut, never move the existing one.
     var cmd = [root.pluginDir + "/keysmith-write", root.capturedKey,
-               root.selected.key || "", root.selected.label,
+               root.selected.key || "", root.selected.identityLabel || root.selected.label,
                root.selected.action || ""]
     var conflict = root.conflictFor(root.capturedKey)
     if (conflict && conflict.key !== root.selected.key)
@@ -228,12 +270,15 @@ Item {
   function confirmRemove() {
     if (!root.selected || !root.selected.key || !root.selected.action || root.operationPending)
       return
-    root.writeOperation = "remove"
+    root.pendingOperation = "remove"
+    root.pendingReturnState = "remove-confirm"
     root.pendingSummary = "Removed " + root.selected.key + " from “" + root.selected.label + "”"
     root.status = "removing..."
-    root.operationPending = true
+    root.viewState = "saving"
     writeProc.command = [root.pluginDir + "/keysmith-write", "remove",
-                         root.selected.key, root.selected.label, root.selected.action]
+                         root.selected.key,
+                         root.selected.identityLabel || root.selected.label,
+                         root.selected.action]
     writeProc.running = true
   }
 
@@ -244,6 +289,7 @@ Item {
     onTriggered: {
       root.successText = ""
       root.selected = null
+      root.viewState = "browsing"
       root.dismiss()
     }
   }
@@ -255,17 +301,19 @@ Item {
       id: readOutput
     }
     onExited: function (exitCode) {
-      root.loading = false
       if (exitCode !== 0) {
         root.rows = []
         root.loadError = "can't read Hyprland bindings — close and try again"
+        root.viewState = "load-error"
         return
       }
       try {
         root.rows = JSON.parse(readOutput.text)
+        root.viewState = "browsing"
       } catch (e) {
         root.rows = []
         root.loadError = "binding catalog returned invalid data"
+        root.viewState = "load-error"
       }
     }
   }
@@ -308,23 +356,28 @@ Item {
   }
 
   function open(payloadJson) {
+    if (writeProc.running) {
+      root.viewState = "saving"
+      root.opened = true
+      Qt.callLater(function () { keyCatcher.forceActiveFocus() })
+      return
+    }
+
     successTimer.stop()
+    captureTimer.stop()
     root.filterText = ""
     root.selected = null
-    root.capturing = false
     root.capturePending = false
     root.capturedKey = ""
     root.status = ""
     root.loadError = ""
-    root.actionMenuOpen = false
     root.actionMenuIndex = 0
-    root.removeConfirm = false
-    root.operationPending = false
-    root.writeOperation = ""
+    root.pendingReturnState = "browsing"
+    root.pendingOperation = ""
     root.pendingSummary = ""
     root.successText = ""
     root.rows = []
-    root.loading = true
+    root.viewState = "loading"
     readProc.running = true
     root.opened = true
     Qt.callLater(function () {
@@ -333,10 +386,18 @@ Item {
   }
 
   function close() {
+    captureTimer.stop()
+    root.capturePending = false
+    if (keysProc.running)
+      keysProc.running = false
     root.opened = false
   }
 
   function dismiss() {
+    captureTimer.stop()
+    root.capturePending = false
+    if (keysProc.running)
+      keysProc.running = false
     root.opened = false
     if (root.shell && typeof root.shell.hide === "function")
       root.shell.hide((root.manifest && root.manifest.id) || "sinkeat.keysmith")
@@ -379,10 +440,7 @@ Item {
 
     MouseArea {
       anchors.fill: parent
-      onClicked: {
-        if (!root.operationPending)
-          root.dismiss()
-      }
+      onClicked: root.dismiss()
     }
 
     Rectangle {
@@ -423,7 +481,7 @@ Item {
         }
 
         Text {
-          visible: root.loadError.length > 0
+          visible: root.viewState === "load-error"
           width: parent.width
           wrapMode: Text.WordWrap
           text: root.loadError
@@ -456,7 +514,31 @@ Item {
         }
 
         Column {
-          visible: root.successText.length > 0
+          visible: root.operationPending
+          width: parent.width
+          spacing: Style.space(8)
+
+          Text {
+            width: parent.width
+            text: root.pendingOperation === "remove"
+              ? "Removing shortcut…" : "Saving shortcut…"
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+          }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Escape or click outside to hide Keysmith. The verified write will continue safely."
+            color: root.foreground
+            opacity: 0.6
+            font.family: root.fontFamily
+          }
+        }
+
+        Column {
+          visible: root.viewState === "success"
           width: parent.width
           spacing: Style.space(10)
 
@@ -557,49 +639,19 @@ Item {
           Row {
             spacing: Style.space(8)
 
-            Rectangle {
+            KeysmithButton {
               width: Style.space(150)
-              height: Style.space(30)
-              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
-              border.color: root.borderColor
-              border.width: 1
-
-              Text {
-                anchors.centerIn: parent
-                text: root.operationPending ? "Removing…" : "Remove · Enter"
-                color: root.foreground
-                font.family: root.fontFamily
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                enabled: !root.operationPending
-                onClicked: root.confirmRemove()
-              }
+              label: "Remove · Enter"
+              primary: true
+              onTriggered: root.confirmRemove()
             }
 
-            Rectangle {
+            KeysmithButton {
               width: Style.space(130)
-              height: Style.space(30)
-              color: "transparent"
-              border.color: root.borderColor
-              border.width: 1
-
-              Text {
-                anchors.centerIn: parent
-                text: "Cancel · Escape"
-                color: root.foreground
-                font.family: root.fontFamily
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                enabled: !root.operationPending
-                onClicked: {
-                  root.removeConfirm = false
-                  root.actionMenuOpen = true
-                  root.status = ""
-                }
+              label: "Cancel · Escape"
+              onTriggered: {
+                root.status = ""
+                root.viewState = "action-menu"
               }
             }
           }
@@ -616,8 +668,7 @@ Item {
         }
 
         Column {
-          visible: (root.capturing || root.capturedKey.length > 0 || root.blockedSelection)
-                   && !root.removeConfirm && root.successText.length === 0
+          visible: root.capturing || root.viewState === "captured" || root.blockedSelection
           width: parent.width
           spacing: Style.space(10)
 
@@ -673,88 +724,39 @@ Item {
             visible: !root.blockedSelection
             spacing: Style.space(8)
 
-            Rectangle {
+            KeysmithButton {
               visible: root.capturedKey.length > 0
               width: Style.space(140)
-              height: Style.space(30)
-              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
-              border.color: root.borderColor
-              border.width: 1
-
-              Text {
-                anchors.centerIn: parent
-                text: {
-                  if (root.operationPending)
-                    return "Saving…"
-                  var conflicts = root.conflictsFor(root.capturedKey)
-                  if (conflicts.length === 0)
-                    return "Save · Enter"
-                  return conflicts.length === 1
-                    ? "Replace · Enter"
-                    : "Replace " + conflicts.length + " · Enter"
-                }
-                color: root.foreground
-                font.family: root.fontFamily
+              label: {
+                var conflicts = root.conflictsFor(root.capturedKey)
+                if (conflicts.length === 0)
+                  return "Save · Enter"
+                return conflicts.length === 1
+                  ? "Replace · Enter"
+                  : "Replace " + conflicts.length + " · Enter"
               }
-
-              MouseArea {
-                anchors.fill: parent
-                enabled: !root.operationPending
-                onClicked: root.commit()
-              }
+              primary: true
+              onTriggered: root.commit()
             }
 
-            Rectangle {
+            KeysmithButton {
               visible: root.capturedKey.length > 0
               width: Style.space(195)
-              height: Style.space(30)
-              color: "transparent"
-              border.color: root.borderColor
-              border.width: 1
-
-              Text {
-                anchors.centerIn: parent
-                text: "Try another · Backspace"
-                color: root.foreground
-                font.family: root.fontFamily
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                enabled: !root.operationPending
-                onClicked: root.retryCapture()
-              }
+              label: "Try another · Backspace"
+              onTriggered: root.retryCapture()
             }
 
-            Rectangle {
+            KeysmithButton {
               width: Style.space(120)
-              height: Style.space(30)
-              color: "transparent"
-              border.color: root.borderColor
-              border.width: 1
-
-              Text {
-                anchors.centerIn: parent
-                text: "Cancel · Esc"
-                color: root.foreground
-                font.family: root.fontFamily
-              }
-
-              MouseArea {
-                anchors.fill: parent
-                enabled: !root.operationPending
-                onClicked: root.cancelCapture()
-              }
+              label: "Cancel · Esc"
+              onTriggered: root.cancelCapture()
             }
           }
         }
 
         ListView {
           id: list
-          visible: !root.loading && !root.capturing && root.capturedKey.length === 0
-                   && !root.blockedSelection && root.loadError.length === 0
-                   && !root.actionMenuOpen && !root.removeConfirm
-                   && root.successText.length === 0
+          visible: root.viewState === "browsing"
           width: parent.width
           height: parent.height - Style.space(104)
           clip: true
@@ -828,53 +830,26 @@ Item {
           visible: list.visible && root.highlightedRow
           spacing: Style.space(8)
 
-          Rectangle {
+          KeysmithButton {
             width: Style.space(220)
-            height: Style.space(30)
-            color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.12)
-            border.color: root.borderColor
-            border.width: 1
-
-            Text {
-              anchors.centerIn: parent
-              text: {
-                var row = root.highlightedRow
-                if (!row)
-                  return ""
-                if (row.editor)
-                  return "Open editor · Enter"
-                if (!row.rebindable)
-                  return "Why view only? · Enter"
-                return (row.key ? "Change shortcut" : "Add shortcut") + " · Enter"
-              }
-              color: root.foreground
-              font.family: root.fontFamily
+            label: {
+              var row = root.highlightedRow
+              if (!row)
+                return ""
+              if (row.editor)
+                return "Open editor · Enter"
+              if (!row.rebindable)
+                return "Why view only? · Enter"
+              return (row.key ? "Change shortcut" : "Add shortcut") + " · Enter"
             }
-
-            MouseArea {
-              anchors.fill: parent
-              onClicked: root.beginCapture()
-            }
+            primary: true
+            onTriggered: root.beginCapture()
           }
 
-          Rectangle {
+          KeysmithButton {
             width: Style.space(175)
-            height: Style.space(30)
-            color: "transparent"
-            border.color: root.borderColor
-            border.width: 1
-
-            Text {
-              anchors.centerIn: parent
-              text: "More… · Right Arrow"
-              color: root.foreground
-              font.family: root.fontFamily
-            }
-
-            MouseArea {
-              anchors.fill: parent
-              onClicked: root.openActionMenu()
-            }
+            label: "More… · Right Arrow"
+            onTriggered: root.openActionMenu()
           }
         }
       }
@@ -886,21 +861,21 @@ Item {
 
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function (event) {
-          if (root.operationPending) {
+          // Escape is always handled first. The panel owns exclusive keyboard
+          // focus, so no interaction state may intercept or defer this path.
+          if (event.key === Qt.Key_Escape) {
+            root.handleEscape()
             event.accepted = true
             return
           }
 
-          if (root.loading) {
-            if (event.key === Qt.Key_Escape)
-              root.dismiss()
+          if (root.operationPending || root.loading || root.viewState === "load-error") {
             event.accepted = true
             return
           }
 
-          if (root.successText.length > 0) {
-            if (event.key === Qt.Key_Escape || event.key === Qt.Key_Return
-                || event.key === Qt.Key_Enter) {
+          if (root.viewState === "success") {
+            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
               successTimer.stop()
               root.successText = ""
               root.dismiss()
@@ -910,19 +885,14 @@ Item {
           }
 
           if (root.removeConfirm) {
-            if (event.key === Qt.Key_Escape) {
-              root.removeConfirm = false
-              root.actionMenuOpen = true
-              root.status = ""
-            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
               root.confirmRemove()
-            }
             event.accepted = true
             return
           }
 
           if (root.actionMenuOpen) {
-            if (event.key === Qt.Key_Escape || event.key === Qt.Key_Left) {
+            if (event.key === Qt.Key_Left) {
               root.closeActionMenu()
             } else if (event.key === Qt.Key_Down) {
               if (root.actionMenuIndex < root.actionMenuItems.length - 1)
@@ -938,13 +908,6 @@ Item {
           }
 
           if (root.capturing) {
-            // Escape first, always. With the inhibitor active every other key
-            // is being swallowed, so this is the only way out.
-            if (event.key === Qt.Key_Escape) {
-              root.cancelCapture()
-              event.accepted = true
-              return
-            }
             if (root.capturePending) {
               event.accepted = true
               return
@@ -961,10 +924,8 @@ Item {
             return
           }
 
-          if (root.capturedKey.length > 0) {
-            if (event.key === Qt.Key_Escape) {
-              root.cancelCapture()
-            } else if (event.key === Qt.Key_Backspace) {
+          if (root.viewState === "captured") {
+            if (event.key === Qt.Key_Backspace) {
               root.retryCapture()
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
               root.commit()
@@ -974,26 +935,11 @@ Item {
           }
 
           if (root.blockedSelection) {
-            if (event.key === Qt.Key_Escape)
-              root.cancelCapture()
             event.accepted = true
             return
           }
 
-          // Escape is handled before anything else. An exclusive keyboard
-          // grab with no way out locks the user out of their session.
-          if (event.key === Qt.Key_Escape) {
-            if (root.capturedKey || root.blockedSelection) {
-              root.cancelCapture()
-              event.accepted = true
-              return
-            }
-            if (root.filterText)
-              root.filterText = ""
-            else
-              root.dismiss()
-            event.accepted = true
-          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+          if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
             root.beginCapture()
             event.accepted = true
           } else if (event.key === Qt.Key_Right) {
