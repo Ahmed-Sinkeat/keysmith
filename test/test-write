@@ -5,6 +5,7 @@
 # its own bug), and "second reload issued after restore".
 set -uo pipefail
 W="$(cd "$(dirname "$0")/.." && pwd)/keysmith-write"
+F="$(cd "$(dirname "$0")/.." && pwd)/keysmith-file"
 fail=0
 say() { if [[ $1 == 0 ]]; then echo "ok   $2"; else echo "FAIL $2"; fail=1; fi }
 owned_block() {
@@ -141,6 +142,65 @@ export KEYSMITH_FAKE_AFTER="new error"
 export KEYSMITH_FAKE_RESTORED="still broken"
 KEYSMITH_TAKEN="" "$W" "SUPER + ALT + L" "" "Worse" '"worse"' >/dev/null 2>&1
 [[ $? -eq 4 ]]; say $? "incomplete rollback exits 4 instead of claiming success"
+
+# 16. A planted destination symlink must be refused without touching its
+#     target. The old path-based cp followed this link and returned success.
+printf 'canary\n' >"$tmp/victim"
+cp "$tmp/victim" "$tmp/victim-before"
+ln -s "$tmp/victim" "$tmp/symlink-bindings.lua"
+env KEYSMITH_BINDINGS="$tmp/symlink-bindings.lua" KEYSMITH_TAKEN='' \
+  KEYSMITH_DRYRUN=1 KEYSMITH_FAKE_BASELINE='' KEYSMITH_FAKE_AFTER='' \
+  "$W" "SUPER + ALT + P" "" "Probe" '"probe"' >/dev/null 2>&1
+[[ $? -eq 5 ]]; say $? "symlinked bindings file is refused"
+cmp -s "$tmp/victim" "$tmp/victim-before"; say $? "symlink target remains byte-identical"
+
+# 17. A special file at the predictable target must not pin a user-invoked
+#     write. O_NONBLOCK plus descriptor type validation should reject it.
+mkfifo "$tmp/fifo-bindings.lua"
+timeout 1s env KEYSMITH_BINDINGS="$tmp/fifo-bindings.lua" KEYSMITH_TAKEN='' \
+  KEYSMITH_DRYRUN=1 KEYSMITH_FAKE_BASELINE='' KEYSMITH_FAKE_AFTER='' \
+  "$W" "SUPER + ALT + P" "" "Probe" '"probe"' >/dev/null 2>&1
+fifo_status=$?
+[[ $fifo_status -eq 5 ]]; say $? "FIFO bindings file is refused without blocking"
+
+# 18. A symlink in the parent path must not redirect creation into another
+#     directory.
+mkdir "$tmp/real-parent"
+ln -s "$tmp/real-parent" "$tmp/link-parent"
+env KEYSMITH_BINDINGS="$tmp/link-parent/bindings.lua" KEYSMITH_TAKEN='' \
+  KEYSMITH_DRYRUN=1 KEYSMITH_FAKE_BASELINE='' KEYSMITH_FAKE_AFTER='' \
+  "$W" "SUPER + ALT + P" "" "Probe" '"probe"' >/dev/null 2>&1
+[[ $? -eq 5 ]]; say $? "symlinked parent directory is refused"
+[[ ! -e "$tmp/real-parent/bindings.lua" ]]; say $? "redirected parent receives no file"
+
+# 19. A previously absent bindings file is published private, and rollback
+#     removes it again when validation fails.
+missing="$tmp/missing-bindings.lua"
+env KEYSMITH_BINDINGS="$missing" KEYSMITH_TAKEN='' KEYSMITH_DRYRUN=1 \
+  KEYSMITH_FAKE_BASELINE='' KEYSMITH_FAKE_AFTER='' KEYSMITH_FAKE_RESTORED='' \
+  "$W" "SUPER + ALT + P" "" "Probe" '"probe"' >/dev/null 2>&1
+[[ $? -eq 0 && -f $missing && $(stat -c %a "$missing") == 600 ]]
+say $? "new bindings file is atomically created with mode 600"
+
+rollback_missing="$tmp/rollback-missing.lua"
+env KEYSMITH_BINDINGS="$rollback_missing" KEYSMITH_TAKEN='' KEYSMITH_DRYRUN=1 \
+  KEYSMITH_FAKE_BASELINE='' KEYSMITH_FAKE_AFTER='new error' KEYSMITH_FAKE_RESTORED='' \
+  "$W" "SUPER + ALT + P" "" "Probe" '"probe"' >/dev/null 2>&1
+[[ $? -eq 3 && ! -e $rollback_missing ]]
+say $? "failed first write restores the originally missing state"
+
+# 20. Snapshot digests make ordinary concurrent changes fail instead of being
+#     silently overwritten.
+mkdir "$tmp/transaction"
+printf 'original\n' >"$tmp/transaction/target"
+metadata=$("$F" snapshot "$tmp/transaction/target" "$tmp/transaction/snapshot" 1024)
+expected=$(jq -r '.sha256' <<<"$metadata")
+printf 'changed\n' >"$tmp/transaction/target"
+printf 'replacement\n' >"$tmp/transaction/source"
+"$F" replace "$tmp/transaction/target" "$tmp/transaction/source" \
+  "$expected" 600 - 1024 >/dev/null 2>&1
+[[ $? -eq 1 && $(<"$tmp/transaction/target") == changed ]]
+say $? "concurrent target change prevents atomic replacement"
 
 rm -rf "$tmp"
 [[ $fail == 0 ]] && echo "PASS" || echo "FAILED"

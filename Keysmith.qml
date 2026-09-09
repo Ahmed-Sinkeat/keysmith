@@ -34,6 +34,7 @@ Item {
   property string pendingOperation: ""
   property string pendingSummary: ""
   property string successText: ""
+  property bool readTimedOut: false
   readonly property bool loading: root.viewState === "loading"
   readonly property bool capturing: root.viewState === "capturing"
   readonly property bool actionMenuOpen: root.viewState === "action-menu"
@@ -55,6 +56,21 @@ Item {
       items.push({ id: "remove", label: "Remove shortcut" })
     items.push({ id: "editor", label: "Open bindings.lua" })
     return items
+  }
+
+  Timer {
+    id: readTimer
+    interval: 15000
+    repeat: false
+    onTriggered: {
+      if (!readProc.running)
+        return
+      root.readTimedOut = true
+      readProc.running = false
+      root.rows = []
+      root.loadError = "shortcut scan timed out — close and try again"
+      root.viewState = "load-error"
+    }
   }
 
   Process {
@@ -301,6 +317,9 @@ Item {
       id: readOutput
     }
     onExited: function (exitCode) {
+      readTimer.stop()
+      if (root.readTimedOut)
+        return
       if (exitCode !== 0) {
         root.rows = []
         root.loadError = "can't read Hyprland bindings — close and try again"
@@ -377,7 +396,9 @@ Item {
     root.pendingSummary = ""
     root.successText = ""
     root.rows = []
+    root.readTimedOut = false
     root.viewState = "loading"
+    readTimer.restart()
     readProc.running = true
     root.opened = true
     Qt.callLater(function () {
@@ -466,6 +487,7 @@ Item {
         Text {
           width: parent.width
           elide: Text.ElideRight
+          textFormat: Text.PlainText
           text: root.filterText.length ? root.filterText : "Type to search…"
           opacity: root.filterText.length ? 1.0 : 0.5
           color: root.foreground
@@ -484,6 +506,7 @@ Item {
           visible: root.viewState === "load-error"
           width: parent.width
           wrapMode: Text.WordWrap
+          textFormat: Text.PlainText
           text: root.loadError
           color: root.foreground
           opacity: 0.75
@@ -497,6 +520,7 @@ Item {
 
           Text {
             width: parent.width
+            textFormat: Text.PlainText
             text: "Loading shortcuts…"
             color: root.foreground
             font.family: root.fontFamily
@@ -506,6 +530,7 @@ Item {
           Text {
             width: parent.width
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
             text: "Reading your Omarchy shortcuts and installed apps."
             color: root.foreground
             opacity: 0.6
@@ -520,6 +545,7 @@ Item {
 
           Text {
             width: parent.width
+            textFormat: Text.PlainText
             text: root.pendingOperation === "remove"
               ? "Removing shortcut…" : "Saving shortcut…"
             color: root.foreground
@@ -530,6 +556,7 @@ Item {
           Text {
             width: parent.width
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
             text: "Escape or click outside to hide Keysmith. The verified write will continue safely."
             color: root.foreground
             opacity: 0.6
@@ -545,6 +572,7 @@ Item {
           Text {
             width: parent.width
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
             text: root.successText
             color: root.foreground
             font.family: root.fontFamily
@@ -552,6 +580,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: "Done"
             color: root.foreground
             opacity: 0.6
@@ -567,6 +596,7 @@ Item {
           Text {
             width: parent.width
             elide: Text.ElideRight
+            textFormat: Text.PlainText
             text: root.selected ? root.selected.label : ""
             color: root.foreground
             font.family: root.fontFamily
@@ -588,6 +618,7 @@ Item {
                 anchors.left: parent.left
                 anchors.leftMargin: Style.space(8)
                 anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
                 text: modelData.label
                 color: root.foreground
                 font.family: root.fontFamily
@@ -604,6 +635,7 @@ Item {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: "Up/Down to choose · Enter to open · Left or Escape to go back"
             color: root.foreground
             opacity: 0.55
@@ -619,6 +651,7 @@ Item {
           Text {
             width: parent.width
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
             text: root.selected
               ? "Remove " + root.selected.key + " from “" + root.selected.label + "”?"
               : "Remove shortcut?"
@@ -630,6 +663,7 @@ Item {
           Text {
             width: parent.width
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
             text: "The item will have no shortcut. This does not restore an Omarchy default."
             color: root.foreground
             opacity: 0.65
@@ -660,6 +694,7 @@ Item {
             width: parent.width
             wrapMode: Text.WordWrap
             visible: root.status.length > 0
+            textFormat: Text.PlainText
             text: root.status
             color: root.foreground
             opacity: 0.7
@@ -675,6 +710,7 @@ Item {
           Text {
             width: parent.width
             elide: Text.ElideRight
+            textFormat: Text.PlainText
             text: root.selected ? root.selected.label : ""
             color: root.foreground
             font.family: root.fontFamily
@@ -687,6 +723,7 @@ Item {
             color: root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
+            textFormat: Text.PlainText
             text: root.capturedKey.length ? root.capturedKey : "Press the keys you want…"
             opacity: root.capturedKey.length ? 1.0 : 0.6
           }
@@ -697,6 +734,7 @@ Item {
             visible: root.capturedKey.length > 0
             color: root.foreground
             font.family: root.fontFamily
+            textFormat: Text.PlainText
             text: {
               if (root.selected && root.selected.key === root.capturedKey)
                 return "unchanged — this is already the shortcut"
@@ -714,6 +752,7 @@ Item {
             width: parent.width
             wrapMode: Text.WordWrap
             visible: root.status.length > 0
+            textFormat: Text.PlainText
             text: root.status
             color: root.foreground
             opacity: 0.7
@@ -780,6 +819,7 @@ Item {
               anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
               elide: Text.ElideRight
+              textFormat: Text.PlainText
               text: modelData.label
               color: root.foreground
               opacity: modelData.rebindable ? 1.0 : 0.45
@@ -792,6 +832,7 @@ Item {
               anchors.right: rowState.visible ? rowState.left : parent.right
               anchors.rightMargin: rowState.visible ? Style.space(8) : Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
               text: modelData.key || ""
               color: root.foreground
               opacity: 0.55
@@ -804,6 +845,7 @@ Item {
               anchors.right: parent.right
               anchors.rightMargin: Style.space(6)
               anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
               text: modelData.key && !modelData.rebindable ? "· view only"
                 : (!modelData.key && (modelData.source === "app" || modelData.source === "action")
                    ? "not bound" : "")

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Emit the Keysmith catalog as a JSON array on stdout. Read-only.
+# Emit the Keysmith catalog as a bounded JSON array on stdout. Read-only.
 #
 # Three sources, three tiers:
 #   hyprctl binds  -> authoritative map of what combos are TAKEN
@@ -10,91 +10,234 @@
 # `dispatcher: __lua` with an opaque callback handle.
 set -uo pipefail
 
+export LC_ALL=C
+
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 KEYS="$HERE/keysmith-keys"
+SAFE_FILE="$HERE/keysmith-file"
 OMARCHY="${OMARCHY_PATH:-/usr/share/omarchy}"
 USER_BINDINGS="${KEYSMITH_BINDINGS:-$HOME/.config/hypr/bindings.lua}"
 HYPRCTL="${KEYSMITH_HYPRCTL:-hyprctl}"
 
-# --- 1. taken combos -> "canonical<TAB>description" -----------------------
-binds_tsv() {
-  local raw
-  if ! raw=$("$HYPRCTL" binds 2>/dev/null); then
-    echo "keysmith: unable to read Hyprland bindings" >&2
-    return 1
-  fi
+# Hard producer ceilings. Tests may tighten them but can never raise them.
+MAX_HYPR_BYTES=1048576
+MAX_BIND_ROWS=2048
+MAX_LUA_FILES=128
+MAX_LUA_FILE_BYTES=262144
+MAX_LUA_TOTAL_BYTES=8388608
+MAX_ACTION_ROWS=2048
+MAX_DESKTOP_FILES=4096
+MAX_DESKTOP_FILE_BYTES=262144
+MAX_DESKTOP_TOTAL_BYTES=33554432
+MAX_APP_ROWS=2048
+MAX_KEY_BYTES=256
+MAX_LABEL_BYTES=1024
+MAX_ACTION_BYTES=8192
+MAX_TSV_BYTES=4194304
+MAX_CATALOG_ROWS=4096
+MAX_JSON_BYTES=8388608
+HYPR_TIMEOUT=3
+FILE_TIMEOUT=1
 
-  printf '%s\n' "$raw" | awk '
+tighten_int_limit() {
+  local current="$1" variable="$2" candidate=""
+  if [[ ${KEYSMITH_TESTING:-0} == 1 ]]; then
+    candidate="${!variable:-}"
+    if [[ $candidate =~ ^[1-9][0-9]*$ ]] && (( candidate < current )); then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  fi
+  printf '%s\n' "$current"
+}
+
+MAX_HYPR_BYTES=$(tighten_int_limit "$MAX_HYPR_BYTES" KEYSMITH_TEST_MAX_HYPR_BYTES)
+MAX_BIND_ROWS=$(tighten_int_limit "$MAX_BIND_ROWS" KEYSMITH_TEST_MAX_BIND_ROWS)
+MAX_LUA_FILES=$(tighten_int_limit "$MAX_LUA_FILES" KEYSMITH_TEST_MAX_LUA_FILES)
+MAX_LUA_FILE_BYTES=$(tighten_int_limit "$MAX_LUA_FILE_BYTES" KEYSMITH_TEST_MAX_LUA_FILE_BYTES)
+MAX_LUA_TOTAL_BYTES=$(tighten_int_limit "$MAX_LUA_TOTAL_BYTES" KEYSMITH_TEST_MAX_LUA_TOTAL_BYTES)
+MAX_ACTION_ROWS=$(tighten_int_limit "$MAX_ACTION_ROWS" KEYSMITH_TEST_MAX_ACTION_ROWS)
+MAX_DESKTOP_FILES=$(tighten_int_limit "$MAX_DESKTOP_FILES" KEYSMITH_TEST_MAX_DESKTOP_FILES)
+MAX_DESKTOP_FILE_BYTES=$(tighten_int_limit "$MAX_DESKTOP_FILE_BYTES" KEYSMITH_TEST_MAX_DESKTOP_FILE_BYTES)
+MAX_DESKTOP_TOTAL_BYTES=$(tighten_int_limit "$MAX_DESKTOP_TOTAL_BYTES" KEYSMITH_TEST_MAX_DESKTOP_TOTAL_BYTES)
+MAX_APP_ROWS=$(tighten_int_limit "$MAX_APP_ROWS" KEYSMITH_TEST_MAX_APP_ROWS)
+MAX_KEY_BYTES=$(tighten_int_limit "$MAX_KEY_BYTES" KEYSMITH_TEST_MAX_KEY_BYTES)
+MAX_LABEL_BYTES=$(tighten_int_limit "$MAX_LABEL_BYTES" KEYSMITH_TEST_MAX_LABEL_BYTES)
+MAX_ACTION_BYTES=$(tighten_int_limit "$MAX_ACTION_BYTES" KEYSMITH_TEST_MAX_ACTION_BYTES)
+MAX_TSV_BYTES=$(tighten_int_limit "$MAX_TSV_BYTES" KEYSMITH_TEST_MAX_TSV_BYTES)
+MAX_CATALOG_ROWS=$(tighten_int_limit "$MAX_CATALOG_ROWS" KEYSMITH_TEST_MAX_CATALOG_ROWS)
+MAX_JSON_BYTES=$(tighten_int_limit "$MAX_JSON_BYTES" KEYSMITH_TEST_MAX_JSON_BYTES)
+if [[ ${KEYSMITH_TESTING:-0} == 1 && ${KEYSMITH_TEST_HYPR_TIMEOUT:-} =~ ^(0|[1-9][0-9]*)(\.[0-9]+)?$ ]]; then
+  HYPR_TIMEOUT="$KEYSMITH_TEST_HYPR_TIMEOUT"
+fi
+
+die() {
+  printf 'keysmith: %s\n' "$1" >&2
+  exit 1
+}
+
+work=$(mktemp -d) || die "unable to create bounded reader workspace"
+chmod 700 "$work" || die "unable to secure bounded reader workspace"
+trap 'rm -rf -- "$work"' EXIT
+
+bounded_command() {
+  local destination="$1" cap="$2" duration="$3"
+  shift 3
+  timeout --foreground --kill-after=1s "${duration}s" "$@" 2>/dev/null |
+    head -c "$((cap + 1))" >"$destination"
+  local statuses=("${PIPESTATUS[@]}") size
+  size=$(wc -c <"$destination") || return 1
+  (( size <= cap )) || return 2
+  (( statuses[0] == 0 && statuses[1] == 0 )) || return 1
+}
+
+bounded_file() {
+  local source="$1" destination="$2" cap="$3" size
+  timeout --foreground --kill-after=1s "${FILE_TIMEOUT}s" \
+    head -c "$((cap + 1))" -- "$source" >"$destination" 2>/dev/null
+  local status=$?
+  size=$(wc -c <"$destination") || return 1
+  (( size <= cap )) || return 2
+  (( status == 0 )) || return 1
+}
+
+# --- 1. taken combos -> "canonical<TAB>description" -----------------------
+produce_bindings() {
+  local raw="$work/hypr.raw" parsed="$work/hypr.parsed" output="$work/binds.tsv"
+  local status count=0 output_bytes=0 mask key description canonical line_bytes
+
+  bounded_command "$raw" "$MAX_HYPR_BYTES" "$HYPR_TIMEOUT" "$HYPRCTL" binds
+  status=$?
+  (( status == 0 )) || {
+    (( status == 2 )) && die "Hyprland binding output exceeds the byte limit"
+    die "unable to read Hyprland bindings"
+  }
+
+  awk '
     function flush() {
-      if (!seen) return; seen = 0
-      printf "%s\t%s\t%s\n", f["modmask"], f["key"], f["description"]
+      if (!seen) return
+      seen = 0
+      printf "%s%c%s%c%s%c", f["modmask"], 0, f["key"], 0, f["description"], 0
     }
     /^bind/ { flush(); seen = 1; delete f; next }
-    seen && match($0, /^\t[a-z]+: /) { f[substr($0, 2, RLENGTH - 3)] = substr($0, RLENGTH + 1) }
+    seen && match($0, /^\t[a-z]+: /) {
+      f[substr($0, 2, RLENGTH - 3)] = substr($0, RLENGTH + 1)
+    }
     END { flush() }
-  ' | while IFS=$'\t' read -r mask key desc; do
-      [[ -z ${key:-} ]] && continue
-      # Some rows repeat the modifiers inside the key field, e.g.
-      # modmask=64 key="SUPER + code:10". modmask is authoritative, so keep
-      # only the final segment as the key. Dropping these rows entirely would
-      # hide every workspace binding from the conflict map.
-      key="${key##* + }"
-      canon=$("$KEYS" hypr "$mask" "$key" 2>/dev/null) || continue
-      printf '%s\t%s\n' "$canon" "${desc:-}"
-    done
+  ' "$raw" >"$parsed" || die "unable to parse Hyprland bindings"
+
+  : >"$output" || die "unable to stage Hyprland bindings"
+  while IFS= read -r -d '' mask \
+      && IFS= read -r -d '' key \
+      && IFS= read -r -d '' description; do
+    [[ -z $key ]] && continue
+    (( count += 1 ))
+    (( count <= MAX_BIND_ROWS )) || die "Hyprland binding row limit exceeded"
+    (( ${#mask} <= 32 && ${#key} <= MAX_KEY_BYTES && ${#description} <= MAX_LABEL_BYTES )) ||
+      die "Hyprland binding field limit exceeded"
+    [[ $mask != *$'\t'* && $key != *$'\t'* && $description != *$'\t'* ]] ||
+      die "tab characters are not allowed in Hyprland binding fields"
+
+    # Some rows repeat the modifiers inside the key field, e.g.
+    # modmask=64 key="SUPER + code:10". modmask is authoritative.
+    key="${key##* + }"
+    canonical=$("$KEYS" hypr "$mask" "$key" 2>/dev/null) || continue
+    (( ${#canonical} <= MAX_KEY_BYTES )) || die "canonical key field limit exceeded"
+    line_bytes=$(( ${#canonical} + ${#description} + 2 ))
+    output_bytes=$((output_bytes + line_bytes))
+    (( output_bytes <= MAX_TSV_BYTES )) || die "Hyprland binding catalog limit exceeded"
+    printf '%s\t%s\n' "$canonical" "$description" >>"$output" ||
+      die "unable to stage Hyprland bindings"
+  done <"$parsed"
 }
 
 # --- 2. action text -> "canonical<TAB>description<TAB>action" -------------
-# Only single-line o.bind calls. Loop-generated and multi-line calls are
-# deliberately unmatched: half-parsing them is worse than declaring them
-# non-rebindable.
-lua_tsv() {
-  local files=()
-  shopt -s nullglob
-  files=("$OMARCHY"/default/hypr/bindings/*.lua)
-  shopt -u nullglob
-  [[ -f $USER_BINDINGS ]] && files+=("$USER_BINDINGS")
-  ((${#files[@]} > 0)) || return 0
+produce_actions() {
+  local output="$work/actions.tsv" stage="$work/lua.raw" matches="$work/lua.matches"
+  local file_count=0 raw_total=0 row_count=0 output_bytes=0
+  local file status size key description action extra canonical line_bytes
+  : >"$output" || die "unable to stage binding actions"
 
-  cat -- "${files[@]}" |
-    sed -nE 's/^[[:space:]]*o\.bind\("([^"]*)"[[:space:]]*,[[:space:]]*"([^"]*)"[[:space:]]*,[[:space:]]*(.*)\)[[:space:]]*$/\1\t\2\t\3/p' |
-    while IFS=$'\t' read -r key desc action; do
+  process_lua_file() {
+    file="$1"
+    (( file_count += 1 ))
+    (( file_count <= MAX_LUA_FILES )) || die "binding Lua file limit exceeded"
+    bounded_file "$file" "$stage" "$MAX_LUA_FILE_BYTES"
+    status=$?
+    (( status == 0 )) || {
+      (( status == 2 )) && die "binding Lua file exceeds the byte limit"
+      die "unable to read binding Lua file safely"
+    }
+    size=$(wc -c <"$stage") || die "unable to size binding Lua file"
+    raw_total=$((raw_total + size))
+    (( raw_total <= MAX_LUA_TOTAL_BYTES )) || die "binding Lua total byte limit exceeded"
+
+    sed -nE 's/^[[:space:]]*o\.bind\("([^"]*)"[[:space:]]*,[[:space:]]*"([^"]*)"[[:space:]]*,[[:space:]]*(.*)\)[[:space:]]*$/\1\t\2\t\3/p' \
+      "$stage" >"$matches" || die "unable to parse binding Lua file"
+    while IFS=$'\t' read -r key description action extra; do
       [[ -z ${key:-} || -z ${action:-} ]] && continue
-      canon=$("$KEYS" lua "$key" 2>/dev/null) || continue
-      printf '%s\t%s\t%s\n' "$canon" "$desc" "$action"
-    done
+      [[ -z ${extra:-} ]] || die "tab characters are not allowed in binding fields"
+      (( row_count += 1 ))
+      (( row_count <= MAX_ACTION_ROWS )) || die "binding action row limit exceeded"
+      (( ${#key} <= MAX_KEY_BYTES && ${#description} <= MAX_LABEL_BYTES && ${#action} <= MAX_ACTION_BYTES )) ||
+        die "binding action field limit exceeded"
+      canonical=$("$KEYS" lua "$key" 2>/dev/null) || continue
+      (( ${#canonical} <= MAX_KEY_BYTES )) || die "canonical action key field limit exceeded"
+      line_bytes=$(( ${#canonical} + ${#description} + ${#action} + 3 ))
+      output_bytes=$((output_bytes + line_bytes))
+      (( output_bytes <= MAX_TSV_BYTES )) || die "binding action catalog limit exceeded"
+      printf '%s\t%s\t%s\n' "$canonical" "$description" "$action" >>"$output" ||
+        die "unable to stage binding actions"
+    done <"$matches"
+  }
+
+  local lua_dir="$OMARCHY/default/hypr/bindings"
+  if [[ -d $lua_dir && ! -L $lua_dir ]]; then
+    while IFS= read -r -d '' file; do
+      process_lua_file "$file"
+    done < <(find -P "$lua_dir" -maxdepth 1 -type f -name '*.lua' -print0)
+  elif [[ -L $lua_dir ]]; then
+    die "binding Lua directory may not be a symlink"
+  fi
+
+  if [[ -e $USER_BINDINGS || -L $USER_BINDINGS ]]; then
+    process_lua_file "$USER_BINDINGS"
+  fi
 }
 
 # --- 3. installed apps -> "name<TAB>exec" ---------------------------------
-apps_tsv() {
-  for d in /usr/share/applications "$HOME/.local/share/applications"; do
-    [[ -d $d ]] || continue
-    for f in "$d"/*.desktop; do
-      [[ -f $f ]] || continue
-      grep -qi '^NoDisplay=true' "$f" && continue
-      grep -qi '^Type=Application' "$f" || continue
-      name=$(sed -n 's/^Name=//p' "$f" | head -1)
-      exec_=$(sed -n 's/^Exec=//p' "$f" | head -1 | sed 's/ *%[a-zA-Z]//g')
-      [[ -z ${name:-} || -z ${exec_:-} ]] && continue
-      printf '%s\t%s\n' "$name" "$exec_"
-    done
-  done | sort -u -t$'\t' -k1,1
+produce_apps() {
+  local app_dirs=(/usr/share/applications "$HOME/.local/share/applications")
+  local status
+  if [[ ${KEYSMITH_TESTING:-0} == 1 && -n ${KEYSMITH_APP_DIRS:-} ]]; then
+    IFS=: read -r -a app_dirs <<<"$KEYSMITH_APP_DIRS"
+  fi
+  bounded_command "$work/apps.tsv" "$MAX_TSV_BYTES" 3 \
+    "$SAFE_FILE" desktop \
+    "$MAX_DESKTOP_FILES" "$MAX_DESKTOP_FILE_BYTES" "$MAX_DESKTOP_TOTAL_BYTES" \
+    "$MAX_APP_ROWS" "$MAX_LABEL_BYTES" "$MAX_ACTION_BYTES" "$MAX_TSV_BYTES" \
+    "${app_dirs[@]}"
+  status=$?
+  (( status == 0 )) || die "unable to read desktop applications within safety limits"
 }
 
-live_bindings=$(binds_tsv) || exit 1
-action_definitions=$(lua_tsv) || { echo "keysmith: unable to read binding actions" >&2; exit 1; }
-desktop_apps=$(apps_tsv)
+produce_bindings
+produce_actions
+produce_apps
 
-jq -n --arg binds "$live_bindings" --arg actions "$action_definitions" --arg apps "$desktop_apps" '
+# Build into a cap+1 sink first. Quickshell's StdioCollector sees nothing until
+# the complete document is known to be valid and within the producer ceiling.
+jq -n \
+  --rawfile binds "$work/binds.tsv" \
+  --rawfile actions "$work/actions.tsv" \
+  --rawfile apps "$work/apps.tsv" \
+  --argjson maxRows "$MAX_CATALOG_ROWS" '
   def tsv_rows($text):
     $text | split("\n") | map(select(length > 0) | split("\t"));
 
   def action_words($action):
     [($action // "" | ascii_downcase) | splits("[^A-Za-z0-9_.+-]+")];
 
-  # Prefer an exact display-name match. It identifies wrappers and webapps
-  # whose shared launcher executable cannot distinguish one desktop entry from
-  # another. Fall back to the executable basename for differently named rows.
   def matching_apps($row; $apps):
     ($apps | map(select(
       (.label | ascii_downcase) == ($row.label | ascii_downcase)
@@ -110,12 +253,6 @@ jq -n --arg binds "$live_bindings" --arg actions "$action_definitions" --arg app
       end;
 
   (tsv_rows($actions)) as $actionDefinitions
-
-  # A key may legitimately own more than one action: ALT+TAB has two press
-  # actions and F9 has distinct press/release actions. Match the description
-  # so the catalog still reports the correct action. Such rows are deliberately
-  # non-rebindable, though: hl.unbind accepts only a key and would remove every
-  # sibling action while Keysmith moved just the selected one.
   | (tsv_rows($binds)) as $liveBindings
   | ($liveBindings | map(
       . as $bind
@@ -135,10 +272,6 @@ jq -n --arg binds "$live_bindings" --arg actions "$action_definitions" --arg app
         }
     )) as $bindingRows
 
-  # Definitions still present in Lua but absent from the live binding map are
-  # actions with no shortcut. This is how a removed default remains searchable
-  # and can be Added again later. Identity is label+opaque action, matching the
-  # the stable owned-block identity used by the writer.
   | ($actionDefinitions
     | unique_by([.[1], .[2]])
     | map(
@@ -163,17 +296,11 @@ jq -n --arg binds "$live_bindings" --arg actions "$action_definitions" --arg app
       label:      .[0],
       key:        null,
       source:     "app",
-      # Exec is arbitrary text from a .desktop file and goes inside a Lua
-      # string. @json quotes and escapes it; hand-built quotes let an Exec
-      # containing " or \ emit Lua that does not parse.
       action:     ("{ launch = " + (.[1] | @json) + " }"),
       rebindable: true,
       base:       (.[1] | split(" ")[0] | split("/") | last | ascii_downcase)
     })) as $desktopApps
 
-  # Merge a desktop app into its live or removed action row. `identityLabel`
-  # preserves the original Lua description for the stable writer block id;
-  # `label` becomes the app name users expect to search for and see.
   | (($bindingRows + $unboundActions) | map(
       . as $row
       | matching_apps($row; $desktopApps) as $matches
@@ -193,5 +320,14 @@ jq -n --arg binds "$live_bindings" --arg actions "$action_definitions" --arg app
       | del(.base, ._appId)
     )) as $unboundApps
 
-  | ($catalogRows | map(del(._matchedAppId))) + $unboundApps
-'
+  | (($catalogRows | map(del(._matchedAppId))) + $unboundApps) as $result
+  | if ($result | length) > $maxRows then error("catalog row limit exceeded")
+    else $result
+    end
+' 2>"$work/jq.error" | head -c "$((MAX_JSON_BYTES + 1))" >"$work/catalog.json"
+jq_statuses=("${PIPESTATUS[@]}")
+json_size=$(wc -c <"$work/catalog.json") || die "unable to size binding catalog"
+(( json_size <= MAX_JSON_BYTES )) || die "binding catalog JSON exceeds the byte limit"
+(( jq_statuses[0] == 0 && jq_statuses[1] == 0 )) || die "unable to assemble binding catalog"
+
+cat -- "$work/catalog.json" || die "unable to emit binding catalog"

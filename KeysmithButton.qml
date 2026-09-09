@@ -18,6 +18,7 @@ Rectangle {
 
   Text {
     anchors.centerIn: parent
+    textFormat: Text.PlainText
     text: button.label
     color: Color.menu.text
     font.family: Style.font.menuFamily

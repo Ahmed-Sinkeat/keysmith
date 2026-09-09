@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""Descriptor-bound filesystem access for Keysmith.
+
+The bindings path is user-writable and predictable. Checking it and reopening
+it later leaves a substitution window, so this helper walks every directory
+with O_NOFOLLOW, validates opened descriptors with fstat, and performs atomic
+replacement relative to the held parent descriptor. Desktop entries use the
+same traversal and validation boundary for bounded, read-only catalog scans.
+"""
+
+import errno
+import hashlib
+import json
+import os
+import re
+import secrets
+import stat
+import sys
+
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_REFUSED = 3
+DEFAULT_MAX_BYTES = 4 * 1024 * 1024
+OPEN_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+OPEN_FILE = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+class Refused(Exception):
+    """A symlink, special file, or wrong owner crossed the trust boundary."""
+
+
+class Failed(Exception):
+    """An ordinary I/O, concurrency, or usage failure."""
+
+
+class Missing(Exception):
+    """An optional input directory is absent."""
+
+
+def warn(message):
+    sys.stderr.write(f"keysmith-file: {message}\n")
+
+
+def parse_limit(value):
+    try:
+        parsed = int(value, 10)
+    except ValueError as exc:
+        raise Failed("max bytes must be a decimal integer") from exc
+    if parsed < 1 or parsed > DEFAULT_MAX_BYTES:
+        raise Failed(f"max bytes must be between 1 and {DEFAULT_MAX_BYTES}")
+    return parsed
+
+
+def parse_mode(value):
+    try:
+        parsed = int(value, 8)
+    except ValueError as exc:
+        raise Failed("mode must be octal") from exc
+    if parsed < 0 or parsed > 0o777:
+        raise Failed("mode must be between 000 and 777")
+    return parsed
+
+
+def split_absolute(path):
+    if not path.startswith("/"):
+        raise Failed("path must be absolute")
+    components = [part for part in path.split("/") if part not in ("", ".")]
+    if not components or any(part == ".." for part in components):
+        raise Failed("path must name a file without '..'")
+    return components[:-1], components[-1]
+
+
+def describe_component(parent_fd, component, walked):
+    try:
+        entry = os.lstat(component, dir_fd=parent_fd)
+    except OSError:
+        return f"{walked} is not a directory"
+    if stat.S_ISLNK(entry.st_mode):
+        return f"{walked} is a symlink"
+    return f"{walked} is not a directory"
+
+
+def open_parent(path):
+    components, name = split_absolute(path)
+    uid = os.getuid()
+    fd = os.open("/", OPEN_DIR)
+    walked = ""
+    try:
+        for component in components:
+            walked += "/" + component
+            try:
+                child = os.open(component, OPEN_DIR, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    raise Missing(f"{walked} does not exist") from exc
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise Refused(describe_component(fd, component, walked)) from exc
+                raise Failed(f"cannot open {walked}: {exc.strerror}") from exc
+            try:
+                opened = os.fstat(child)
+                if not stat.S_ISDIR(opened.st_mode):
+                    raise Refused(f"{walked} is not a directory")
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(fd)
+            fd = child
+
+        parent = os.fstat(fd)
+        if parent.st_uid != uid:
+            raise Refused("target directory is not owned by the current user")
+        return fd, name
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def open_directory(path):
+    if not path.startswith("/"):
+        raise Failed("directory path must be absolute")
+    components = [part for part in path.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in components):
+        raise Failed("directory path may not contain '..'")
+    fd = os.open("/", OPEN_DIR)
+    walked = ""
+    try:
+        for component in components:
+            walked += "/" + component
+            try:
+                child = os.open(component, OPEN_DIR, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    raise Missing(f"{walked} does not exist") from exc
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise Refused(describe_component(fd, component, walked)) from exc
+                raise Failed(f"cannot open {walked}: {exc.strerror}") from exc
+            os.close(fd)
+            fd = child
+        opened = os.fstat(fd)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise Refused(f"{path} is not a directory")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def open_regular(parent_fd, name, display, allow_missing=False):
+    try:
+        fd = os.open(name, OPEN_FILE, dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT and allow_missing:
+            return None
+        if exc.errno == errno.ELOOP:
+            raise Refused(f"{display} is a symlink") from exc
+        raise Failed(f"cannot open {display}: {exc.strerror}") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise Refused(f"{display} is not a regular file")
+        if opened.st_uid != os.getuid():
+            raise Refused(f"{display} is not owned by the current user")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_and_hash(fd, display, max_bytes, output_fd=None):
+    digest = hashlib.sha256()
+    total = 0
+    before = os.fstat(fd)
+    while True:
+        chunk = os.read(fd, min(65536, max_bytes - total + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise Failed(f"{display} exceeds {max_bytes} bytes")
+        digest.update(chunk)
+        if output_fd is not None:
+            view = memoryview(chunk)
+            while view:
+                written = os.write(output_fd, view)
+                if written <= 0:
+                    raise Failed(f"short write while copying {display}")
+                view = view[written:]
+    after = os.fstat(fd)
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if identity_before != identity_after:
+        raise Failed(f"{display} changed while it was being read")
+    return digest.hexdigest(), before
+
+
+def create_exclusive(path, mode=0o600):
+    parent_fd, name = open_parent(path)
+    try:
+        try:
+            fd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                mode,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                raise Refused("private snapshot path already exists") from exc
+            raise Failed(f"cannot create private snapshot: {exc.strerror}") from exc
+        os.fchmod(fd, mode)
+        return parent_fd, name, fd
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def command_snapshot(target, snapshot, max_bytes):
+    target_parent, target_name = open_parent(target)
+    snapshot_parent = None
+    snapshot_name = None
+    snapshot_fd = None
+    target_fd = None
+    try:
+        target_fd = open_regular(target_parent, target_name, target, allow_missing=True)
+        snapshot_parent, snapshot_name, snapshot_fd = create_exclusive(snapshot)
+        if target_fd is None:
+            os.fsync(snapshot_fd)
+            metadata = {
+                "exists": False,
+                "sha256": hashlib.sha256(b"").hexdigest(),
+                "mode": "600",
+                "mtimeNs": "-",
+            }
+        else:
+            digest, opened = read_and_hash(target_fd, target, max_bytes, snapshot_fd)
+            os.fsync(snapshot_fd)
+            metadata = {
+                "exists": True,
+                "sha256": digest,
+                "mode": format(stat.S_IMODE(opened.st_mode) & 0o777, "03o"),
+                "mtimeNs": str(opened.st_mtime_ns),
+            }
+        sys.stdout.write(json.dumps(metadata, separators=(",", ":")) + "\n")
+        return EXIT_OK
+    except BaseException:
+        if snapshot_name is not None and snapshot_parent is not None:
+            try:
+                os.unlink(snapshot_name, dir_fd=snapshot_parent)
+            except OSError:
+                pass
+        raise
+    finally:
+        if target_fd is not None:
+            os.close(target_fd)
+        if snapshot_fd is not None:
+            os.close(snapshot_fd)
+        if snapshot_parent is not None:
+            os.close(snapshot_parent)
+        os.close(target_parent)
+
+
+def current_digest(parent_fd, name, display, max_bytes):
+    fd = open_regular(parent_fd, name, display, allow_missing=True)
+    if fd is None:
+        return None
+    try:
+        digest, _ = read_and_hash(fd, display, max_bytes)
+        return digest
+    finally:
+        os.close(fd)
+
+
+def require_expected(parent_fd, name, display, expected, max_bytes):
+    actual = current_digest(parent_fd, name, display, max_bytes)
+    if expected == "missing":
+        if actual is not None:
+            raise Failed(f"{display} appeared during the transaction")
+        return
+    if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+        raise Failed("expected digest is invalid")
+    if actual != expected:
+        raise Failed(f"{display} changed during the transaction")
+
+
+def open_source(path):
+    parent_fd, name = open_parent(path)
+    try:
+        fd = open_regular(parent_fd, name, path)
+        return parent_fd, fd
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def command_replace(target, source, expected, mode, mtime_ns, max_bytes):
+    target_parent, target_name = open_parent(target)
+    source_parent = None
+    source_fd = None
+    temp_name = None
+    temp_fd = None
+    try:
+        require_expected(target_parent, target_name, target, expected, max_bytes)
+        source_parent, source_fd = open_source(source)
+
+        for _ in range(16):
+            candidate = f".{target_name}.keysmith-{secrets.token_hex(8)}.tmp"
+            try:
+                temp_fd = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    mode,
+                    dir_fd=target_parent,
+                )
+                temp_name = candidate
+                break
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                raise Failed(f"cannot create atomic sibling: {exc.strerror}") from exc
+        if temp_fd is None:
+            raise Failed("cannot allocate an atomic sibling")
+
+        os.fchmod(temp_fd, mode)
+        read_and_hash(source_fd, source, max_bytes, temp_fd)
+        if mtime_ns is not None:
+            os.utime(temp_fd, ns=(mtime_ns, mtime_ns))
+        os.fsync(temp_fd)
+        os.close(temp_fd)
+        temp_fd = None
+
+        # Recheck after staging so an ordinary concurrent edit is not silently
+        # overwritten. A substitution after this point is replaced, not
+        # followed, because rename remains relative to target_parent.
+        require_expected(target_parent, target_name, target, expected, max_bytes)
+        os.replace(
+            temp_name,
+            target_name,
+            src_dir_fd=target_parent,
+            dst_dir_fd=target_parent,
+        )
+        temp_name = None
+        try:
+            os.fsync(target_parent)
+        except OSError:
+            pass
+        return EXIT_OK
+    finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name, dir_fd=target_parent)
+            except OSError:
+                pass
+        if source_fd is not None:
+            os.close(source_fd)
+        if source_parent is not None:
+            os.close(source_parent)
+        os.close(target_parent)
+
+
+def command_remove(target, expected, max_bytes):
+    parent_fd, name = open_parent(target)
+    try:
+        require_expected(parent_fd, name, target, expected, max_bytes)
+        if current_digest(parent_fd, name, target, max_bytes) is None:
+            raise Failed(f"{target} disappeared during rollback")
+        os.unlink(name, dir_fd=parent_fd)
+        try:
+            os.fsync(parent_fd)
+        except OSError:
+            pass
+        return EXIT_OK
+    finally:
+        os.close(parent_fd)
+
+
+def parse_desktop_limit(value, maximum, label):
+    try:
+        parsed = int(value, 10)
+    except ValueError as exc:
+        raise Failed(f"{label} must be a decimal integer") from exc
+    if parsed < 1 or parsed > maximum:
+        raise Failed(f"{label} must be between 1 and {maximum}")
+    return parsed
+
+
+def read_desktop_file(directory_fd, name, display, max_bytes):
+    try:
+        fd = os.open(name, OPEN_FILE, dir_fd=directory_fd)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise Refused(f"{display} is a symlink") from exc
+        raise Failed(f"cannot open {display}: {exc.strerror}") from exc
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise Refused(f"{display} is not a regular file")
+        data = bytearray()
+        while True:
+            chunk = os.read(fd, min(65536, max_bytes - len(data) + 1))
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > max_bytes:
+                raise Failed(f"{display} exceeds its byte limit")
+        after = os.fstat(fd)
+        identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        if identity_before != identity_after:
+            raise Failed(f"{display} changed while it was being read")
+        return bytes(data)
+    finally:
+        os.close(fd)
+
+
+def parse_desktop(data, max_label_bytes, max_exec_bytes):
+    hidden = False
+    application = False
+    name = None
+    command = None
+    for line in data.splitlines():
+        lowered = line.lower()
+        if lowered == b"nodisplay=true":
+            hidden = True
+        elif lowered == b"type=application":
+            application = True
+        elif name is None and line.startswith(b"Name="):
+            name = line[5:]
+        elif command is None and line.startswith(b"Exec="):
+            command = line[5:]
+    if hidden or not application or not name or not command:
+        return None
+    command = re.sub(rb" *%[A-Za-z]", b"", command)
+    if len(name) > max_label_bytes or len(command) > max_exec_bytes:
+        raise Failed("desktop application field limit exceeded")
+    if any(char in name for char in (b"\t", b"\x00")) or any(
+        char in command for char in (b"\t", b"\x00")
+    ):
+        raise Failed("desktop application fields contain a forbidden delimiter")
+    try:
+        return name.decode("utf-8"), command.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise Failed("desktop application fields are not valid UTF-8") from exc
+
+
+def command_desktop(arguments):
+    if len(arguments) < 9:
+        raise Failed("desktop requires seven limits and at least one directory")
+    maxima = (4096, 262144, 33554432, 2048, 1024, 8192, 4194304)
+    labels = (
+        "max files",
+        "max file bytes",
+        "max total bytes",
+        "max rows",
+        "max label bytes",
+        "max exec bytes",
+        "max output bytes",
+    )
+    limits = [
+        parse_desktop_limit(value, maximum, label)
+        for value, maximum, label in zip(arguments[1:8], maxima, labels)
+    ]
+    max_files, max_file_bytes, max_total_bytes, max_rows, max_label, max_exec, max_output = limits
+    directories = arguments[8:]
+    if len(directories) > 8:
+        raise Failed("too many desktop application directories")
+
+    entry_count = 0
+    file_count = 0
+    total_bytes = 0
+    rows = []
+    for directory in directories:
+        try:
+            directory_fd = open_directory(directory)
+        except Missing:
+            continue
+        try:
+            with os.scandir(directory_fd) as entries:
+                for entry in entries:
+                    entry_count += 1
+                    if entry_count > max_files:
+                        raise Failed("desktop application file limit exceeded")
+                    if not entry.name.endswith(".desktop"):
+                        continue
+                    if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                        continue
+                    file_count += 1
+                    if file_count > max_files:
+                        raise Failed("desktop application file limit exceeded")
+                    data = read_desktop_file(
+                        directory_fd,
+                        entry.name,
+                        f"{directory}/{entry.name}",
+                        max_file_bytes,
+                    )
+                    total_bytes += len(data)
+                    if total_bytes > max_total_bytes:
+                        raise Failed("desktop application total byte limit exceeded")
+                    parsed = parse_desktop(data, max_label, max_exec)
+                    if parsed is None:
+                        continue
+                    rows.append(parsed)
+                    if len(rows) > max_rows:
+                        raise Failed("desktop application row limit exceeded")
+        finally:
+            os.close(directory_fd)
+
+    output = bytearray()
+    seen_names = set()
+    for name, command in sorted(set(rows)):
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        encoded = f"{name}\t{command}\n".encode("utf-8")
+        output.extend(encoded)
+        if len(output) > max_output:
+            raise Failed("desktop application catalog limit exceeded")
+    sys.stdout.buffer.write(output)
+    sys.stdout.buffer.flush()
+    return EXIT_OK
+
+
+USAGE = """usage:
+  keysmith-file snapshot <target> <private-snapshot> [max-bytes]
+  keysmith-file replace <target> <source> <expected-sha|missing> <mode> <mtime-ns|-> [max-bytes]
+  keysmith-file remove <target> <expected-sha> [max-bytes]
+  keysmith-file desktop <limits...> <directory>...
+"""
+
+
+def main(arguments):
+    if not arguments or arguments[0] in ("-h", "--help", "help"):
+        sys.stdout.write(USAGE)
+        return EXIT_OK
+
+    try:
+        command = arguments[0]
+        if command == "snapshot" and len(arguments) in (3, 4):
+            limit = parse_limit(arguments[3]) if len(arguments) == 4 else DEFAULT_MAX_BYTES
+            return command_snapshot(arguments[1], arguments[2], limit)
+        if command == "replace" and len(arguments) in (6, 7):
+            limit = parse_limit(arguments[6]) if len(arguments) == 7 else DEFAULT_MAX_BYTES
+            mode = parse_mode(arguments[4])
+            mtime_ns = None if arguments[5] == "-" else int(arguments[5], 10)
+            return command_replace(arguments[1], arguments[2], arguments[3], mode, mtime_ns, limit)
+        if command == "remove" and len(arguments) in (3, 4):
+            limit = parse_limit(arguments[3]) if len(arguments) == 4 else DEFAULT_MAX_BYTES
+            return command_remove(arguments[1], arguments[2], limit)
+        if command == "desktop":
+            return command_desktop(arguments)
+        raise Failed("invalid arguments")
+    except Refused as exc:
+        warn(str(exc))
+        return EXIT_REFUSED
+    except (Failed, Missing, OSError, ValueError) as exc:
+        warn(str(exc))
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

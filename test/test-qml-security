@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Every plugin-owned Text element must render literal text. Qt's default
+# AutoText mode treats markup-shaped local metadata as rich text and may load
+# resources in the shared shell process.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+fail=0
+say() { if [[ $1 == 0 ]]; then echo "ok   $2"; else echo "FAIL $2"; fail=1; fi; }
+
+text_count=$(rg -n '^[[:space:]]*Text[[:space:]]*\{' \
+  "$ROOT/Keysmith.qml" "$ROOT/KeysmithButton.qml" | wc -l)
+plain_count=$(rg -n '^[[:space:]]*textFormat:[[:space:]]*Text\.PlainText[[:space:]]*$' \
+  "$ROOT/Keysmith.qml" "$ROOT/KeysmithButton.qml" | wc -l)
+
+[[ $text_count -gt 0 && $plain_count -eq $text_count ]]
+say $? "all $text_count plugin-owned Text elements force PlainText"
+
+[[ $fail == 0 ]] && echo "PASS" || echo "FAILED"
+exit $fail

@@ -16,6 +16,8 @@ mkdir -p "$tmp/omarchy/default/hypr/bindings" "$tmp/home/.local/share/applicatio
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   '[[ ${KEYSMITH_FAIL_BINDS:-0} == 1 ]] && exit 7' \
+  '[[ ${KEYSMITH_SLOW_BINDS:-0} == 1 ]] && { sleep 2; exit 0; }' \
+  '[[ ${KEYSMITH_BIG_BINDS:-0} == 1 ]] && { head -c 4096 /dev/zero | tr "\\0" x; exit 0; }' \
   '[[ ${1:-} == binds ]] || exit 9' \
   "printf 'bind\\n\\tmodmask: 8\\n\\tkey: TAB\\n\\tdescription: Focus on next window\\n'" \
   "printf 'bind\\n\\tmodmask: 8\\n\\tkey: TAB\\n\\tdescription: Reveal active window on top\\n'" \
@@ -57,6 +59,14 @@ printf '%s\n' \
   'Name=AI assistant' \
   'Exec=omarchy-launch-webapp https://assistant.invalid' \
   >"$tmp/home/.local/share/applications/assistant.desktop"
+printf '%s\n' \
+  '[Desktop Entry]' \
+  'Type=Application' \
+  'Name=Symlinked application' \
+  'Exec=symlinked-command' \
+  >"$tmp/symlinked.desktop"
+ln -s "$tmp/symlinked.desktop" "$tmp/home/.local/share/applications/symlinked.desktop"
+mkfifo "$tmp/home/.local/share/applications/special.desktop"
 
 catalog=$(HOME="$tmp/home" OMARCHY_PATH="$tmp/omarchy" \
   KEYSMITH_BINDINGS="$tmp/bindings.lua" KEYSMITH_HYPRCTL="$tmp/hyprctl" \
@@ -89,11 +99,44 @@ jq -e 'any(.[]; .label == "AI assistant" and .identityLabel == "AI assistant" an
 say $? "matching label merges a webapp whose launcher basename is shared"
 jq -e '[.[] | select(.label == "AI assistant")] | length == 1' <<<"$catalog" >/dev/null
 say $? "label-matched webapp is not duplicated as unbound"
+jq -e 'all(.[]; .label != "Symlinked application")' <<<"$catalog" >/dev/null
+say $? "desktop symlinks are not followed into the catalog"
 
 KEYSMITH_FAIL_BINDS=1 HOME="$tmp/home" OMARCHY_PATH="$tmp/omarchy" \
   KEYSMITH_BINDINGS="$tmp/bindings.lua" KEYSMITH_HYPRCTL="$tmp/hyprctl" \
   "$R" >/dev/null 2>&1
 [[ $? -ne 0 ]]; say $? "failed Hyprland scan fails closed"
+
+expect_bounded_failure() {
+  local label="$1"
+  shift
+  local output status
+  output=$(env HOME="$tmp/home" OMARCHY_PATH="$tmp/omarchy" \
+    KEYSMITH_BINDINGS="$tmp/bindings.lua" KEYSMITH_HYPRCTL="$tmp/hyprctl" \
+    KEYSMITH_APP_DIRS="$tmp/home/.local/share/applications" \
+    KEYSMITH_TESTING=1 \
+    "$@" "$R" 2>/dev/null)
+  status=$?
+  [[ $status -ne 0 && -z $output ]]
+  say $? "$label"
+}
+
+# Security boundaries are lowered only for these tests. Production limits are
+# fixed upper bounds; the test overrides can tighten but never raise them.
+expect_bounded_failure "oversized compositor output fails without partial JSON" \
+  KEYSMITH_BIG_BINDS=1 KEYSMITH_TEST_MAX_HYPR_BYTES=64
+expect_bounded_failure "stalled compositor query reaches its deadline" \
+  KEYSMITH_SLOW_BINDS=1 KEYSMITH_TEST_HYPR_TIMEOUT=0.1
+expect_bounded_failure "excess live binding rows fail closed" \
+  KEYSMITH_TEST_MAX_BIND_ROWS=2
+expect_bounded_failure "oversized metadata fields fail closed" \
+  KEYSMITH_TEST_MAX_LABEL_BYTES=16
+expect_bounded_failure "oversized Lua files fail before parsing" \
+  KEYSMITH_TEST_MAX_LUA_FILE_BYTES=64
+expect_bounded_failure "excess desktop files fail before catalog assembly" \
+  KEYSMITH_TEST_MAX_DESKTOP_FILES=2
+expect_bounded_failure "oversized final JSON never reaches the shell collector" \
+  KEYSMITH_TEST_MAX_JSON_BYTES=64
 
 [[ $fail == 0 ]] && echo "PASS" || echo "FAILED"
 exit $fail

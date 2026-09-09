@@ -71,6 +71,10 @@ last row opens `bindings.lua` in your editor for those.
 
 None. Keysmith has no settings.
 
+Its helpers use Bash, jq, coreutils, and Python 3, all included with Omarchy.
+Python provides descriptor-bound, no-follow filesystem access for binding
+transactions and desktop application scans.
+
 It writes to `~/.config/hypr/bindings.lua`, only inside marked state blocks it
 owns:
 

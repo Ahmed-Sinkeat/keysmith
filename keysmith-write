@@ -34,10 +34,16 @@
 #   the live session stays wrong - which looks like success and is not.
 set -uo pipefail
 
+export LC_ALL=C
+
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 KEYS="$HERE/keysmith-keys"
+SAFE_FILE="$HERE/keysmith-file"
 BINDINGS="${KEYSMITH_BINDINGS:-$HOME/.config/hypr/bindings.lua}"
 HYPRCTL="${KEYSMITH_HYPRCTL:-hyprctl}"
+MAX_BINDINGS_BYTES=4194304
+MAX_CONFIGERROR_BYTES=1048576
+HYPR_TIMEOUT=3
 
 mode=set
 if [[ ${1:-} == remove ]]; then
@@ -55,6 +61,18 @@ fi
 replace=0
 [[ $mode == set && "${5:-}" == "--replace" ]] && replace=1
 
+if (( ${#key} > 256 || ${#old_key} > 256 || ${#label} > 1024 || ${#action} > 8192 )); then
+  echo "keysmith: input field exceeds the write limit - nothing written" >&2
+  exit 5
+fi
+
+work=$(mktemp -d) || exit 5
+chmod 700 "$work" || exit 5
+backup="$work/original"
+candidate="$work/candidate"
+catalog_file="$work/catalog.json"
+trap 'rm -rf -- "$work"' EXIT
+
 phase=baseline
 reload_count=0
 
@@ -70,11 +88,15 @@ configerrors() {
       ;;
   esac
 
-  local output
-  if ! output=$("$HYPRCTL" configerrors 2>/dev/null); then
-    return 1
-  fi
-  printf '%s\n' "$output" | awk 'NF'
+  local output_file="$work/configerrors.$phase" size
+  timeout --foreground --kill-after=1s "${HYPR_TIMEOUT}s" \
+    "$HYPRCTL" configerrors 2>/dev/null |
+    head -c "$((MAX_CONFIGERROR_BYTES + 1))" >"$output_file"
+  local statuses=("${PIPESTATUS[@]}")
+  size=$(wc -c <"$output_file") || return 1
+  (( size <= MAX_CONFIGERROR_BYTES )) || return 1
+  (( statuses[0] == 0 && statuses[1] == 0 )) || return 1
+  awk 'NF' "$output_file"
 }
 
 reload() {
@@ -86,7 +108,8 @@ reload() {
     return 1
   fi
   [[ ${KEYSMITH_DRYRUN:-0} == 1 ]] && return 0
-  "$HYPRCTL" reload >/dev/null 2>&1
+  timeout --foreground --kill-after=1s "${HYPR_TIMEOUT}s" \
+    "$HYPRCTL" reload >/dev/null 2>&1
 }
 
 is_taken() {
@@ -95,11 +118,12 @@ is_taken() {
     return 1
   fi
 
-  local catalog status
-  if ! catalog=$("$HERE/keysmith-read" 2>/dev/null); then
+  local status
+  if ! timeout --foreground --kill-after=1s 15s \
+      "$HERE/keysmith-read" >"$catalog_file" 2>/dev/null; then
     return 2
   fi
-  jq -e --arg k "$key" 'any(.[]; .key == $k)' <<<"$catalog" >/dev/null 2>&1
+  jq -e --arg k "$key" 'any(.[]; .key == $k)' "$catalog_file" >/dev/null 2>&1
   status=$?
   [[ $status == 0 ]] && return 0
   [[ $status == 1 ]] && return 1
@@ -139,17 +163,32 @@ if [[ -n "$old_key" ]] && ! old_write_key=$("$KEYS" spell "$old_key"); then
   exit 5
 fi
 
-mkdir -p "$(dirname "$BINDINGS")" || exit 5
-existed=0
-[[ -e "$BINDINGS" ]] && existed=1
-backup=$(mktemp) || exit 5
-candidate=$(mktemp) || { rm -f "$backup"; exit 5; }
-trap 'rm -f "$backup" "$candidate"' EXIT
-if (( existed )); then
-  cp --preserve=mode,timestamps -- "$BINDINGS" "$backup" || exit 5
-else
-  : >"$backup" || exit 5
+if ! metadata=$("$SAFE_FILE" snapshot "$BINDINGS" "$backup" "$MAX_BINDINGS_BYTES"); then
+  echo "keysmith: unsafe or unreadable bindings file - nothing written" >&2
+  exit 5
 fi
+if ! jq -e '
+    (.exists | type) == "boolean"
+    and (.sha256 | type) == "string"
+    and (.sha256 | test("^[0-9a-f]{64}$"))
+    and (.mode | type) == "string"
+    and (.mode | test("^[0-7]{3}$"))
+    and (.mtimeNs | type) == "string"
+    and (.mtimeNs | test("^(-|[0-9]+)$"))
+  ' <<<"$metadata" >/dev/null; then
+  echo "keysmith: invalid file snapshot - nothing written" >&2
+  exit 5
+fi
+if [[ $(jq -r '.exists' <<<"$metadata") == true ]]; then
+  existed=1
+  expected_hash=$(jq -r '.sha256' <<<"$metadata")
+  original_mtime=$(jq -r '.mtimeNs' <<<"$metadata")
+else
+  existed=0
+  expected_hash=missing
+  original_mtime=-
+fi
+file_mode=$(jq -r '.mode' <<<"$metadata")
 
 # The action identity is stable across Add, Change, and Remove. A matching
 # owned block can therefore be replaced in place instead of stacking an
@@ -196,8 +235,10 @@ if (( begin_count == 1 )); then
       and .action == $action
       and (.currentKey | type) == "string"
       and (.state == "bound" or .state == "removed")
+      and (.currentKey | utf8bytelength) <= 256
       and (.disabledKeys | type) == "array"
-      and all(.disabledKeys[]; type == "string" and length > 0)
+      and (.disabledKeys | length) <= 256
+      and all(.disabledKeys[]; type == "string" and length > 0 and utf8bytelength <= 256)
     ' <<<"$state_json" >/dev/null; then
     echo "keysmith: owned block $id has invalid state - nothing written" >&2
     exit 5
@@ -219,6 +260,10 @@ add_disabled "$prior_current"
 add_disabled "$old_key"
 if [[ $mode == set ]] && (( replace )); then
   add_disabled "$key"
+fi
+if ! jq -e 'length <= 256' <<<"$disabled_json" >/dev/null; then
+  echo "keysmith: owned block has too many disabled keys - nothing written" >&2
+  exit 5
 fi
 
 current_key=""
@@ -276,16 +321,24 @@ else
   cp -- "$backup" "$candidate" || exit 5
 fi
 
+published=0
+published_hash=""
+
 restore_file() {
   if (( existed )); then
-    cp --preserve=mode,timestamps -- "$backup" "$BINDINGS"
+    "$SAFE_FILE" replace "$BINDINGS" "$backup" "$published_hash" \
+      "$file_mode" "$original_mtime" "$MAX_BINDINGS_BYTES"
   else
-    rm -f -- "$BINDINGS"
+    "$SAFE_FILE" remove "$BINDINGS" "$published_hash" "$MAX_BINDINGS_BYTES"
   fi
 }
 
 rollback() {
   local exit_code="$1" message="$2" restored
+  if (( ! published )); then
+    echo "$message: nothing written" >&2
+    exit "$exit_code"
+  fi
   if ! restore_file || ! reload; then
     echo "ROLLBACK INCOMPLETE - inspect $BINDINGS by hand" >&2
     exit 4
@@ -317,9 +370,13 @@ if ! {
   rollback 6 "write failed, restored"
 fi
 
-if ! cp -- "$candidate" "$BINDINGS"; then
-  rollback 6 "write failed, restored"
+published_hash=$(sha256sum "$candidate" | cut -d' ' -f1)
+[[ $published_hash =~ ^[0-9a-f]{64}$ ]] || rollback 6 "write failed"
+if ! "$SAFE_FILE" replace "$BINDINGS" "$candidate" "$expected_hash" \
+    "$file_mode" - "$MAX_BINDINGS_BYTES"; then
+  rollback 6 "write failed"
 fi
+published=1
 
 if ! reload; then
   rollback 6 "reload failed, restored"
