@@ -1,3 +1,4 @@
 *.bak
 *.log
 .qmlls.ini
+/CLAUDE.md

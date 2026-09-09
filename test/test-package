@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Marketplace plugins must not ship instruction files that can steer coding
+# agents inspecting the installed checkout.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+fail=0
+
+for path in \
+  CLAUDE.md \
+  AGENTS.md \
+  .github/copilot-instructions.md \
+  .cursorrules \
+  .cursor/rules \
+  .windsurfrules; do
+  if [[ -e "$ROOT/$path" ]]; then
+    echo "FAIL installable tree contains agent-control instructions: $path"
+    fail=1
+  fi
+done
+
+[[ $fail == 0 ]] && echo "PASS no agent-control instructions in installable tree"
+exit $fail
